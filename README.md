@@ -1,16 +1,18 @@
-# MiMo Stable — Degenerate Loop Fix
+# MiMo Stable
 
-> Three-layer defense against repetition deadlocks in MiMo-series LLMs. If your MiMo model is stuck in a loop, these are the exact parameters that fix it.
+> Your MiMo model is repeating itself like a broken record? Cool. Here's the kill switch.
 
-## The Problem
+## What's Broken
 
-MiMo models (xiaomimimo series) occasionally enter a degenerative loop — spitting out identical text blocks 8+ times for 6+ minutes, or storming the same tool call with zero progress.
+MiMo (xiaomimimo series) has a pathology where it locks into a degenerate loop — same output, same tool call, same everything. 8 times. 6 minutes. Zero progress.
 
-**Root cause:** MiMo's English reasoning chain is unstable. Switching to English during thinking collapses the output distribution into a fixed-point attractor.
+**Why:** English reasoning path is unstable. The model's internal distribution collapses into a fixed-point attractor during English thinking. Once it's there, it stays there.
 
-## The Fix (3 Layers)
+## The Kill Switch
 
-### 1. Sampling Parameters (the numbers)
+Three layers. None optional.
+
+### Layer 1 — The Numbers
 
 ```json
 {
@@ -20,15 +22,19 @@ MiMo models (xiaomimimo series) occasionally enter a degenerative loop — spitt
 }
 ```
 
-`frequency_penalty: 0.8` is the MVP. Without it, the model happily outputs the same line forever. `temperature: 0.6` is the only officially documented parameter (from MiMo GitHub README).
+`frequency_penalty: 0.8` does the heavy lifting. Without it the model will literally print the same line until you run out of tokens. `temperature: 0.6` is the only number MiMo's own docs recommend. Everything else was found by breaking stuff.
 
-### 2. Language Enforcement
+### Layer 2 — Language Lock
 
-Force Chinese-only output. MiMo's English path triggers the loop. Chinese sidesteps it entirely.
+Force Chinese-only. Yes, really. MiMo's English reasoning path IS the bug. Chinese sidesteps the unstable code path. This isn't a cosmetic choice — it's a structural fix.
 
-### 3. Runtime Detection
+### Layer 3 — Kill Switch
 
-Embed loop detection in your agent config: 3+ identical outputs = kill current task, send interrupt, change strategy.
+```
+3+ identical outputs → abort task → send interrupt → new strategy
+```
+
+Embed this in your agent. If your agent can't detect its own loop, it deserves to be replaced.
 
 ## OpenClaw Config
 
@@ -46,20 +52,23 @@ Embed loop detection in your agent config: 3+ identical outputs = kill current t
 }
 ```
 
-## What Didn't Work
+Apply to all four MiMo variants. They share the same architecture. They share the same bug.
 
-| Tried | Result |
-|-------|--------|
-| Higher temperature | More randomness, still loops |
-| Lower temperature | Deterministic collapse |
-| maxTokens cap | Delays, doesn't prevent |
-| Detection-only (no params) | Catches but doesn't stop |
+## The Graveyard of Bad Ideas
+
+| Attempt | Why It Failed |
+|---------|---------------|
+| Crank temperature up | More randomness. More loops. Great. |
+| Crank temperature down | Deterministic collapse. Literally guaranteed loop. |
+| Cap maxTokens | Delays death by 2 minutes. Doesn't prevent it. |
+| Detection-only, no params | Congratulations, you saw the loop happen. Still happened. |
+| Context window compression | Zero effect. The bug is in the generation, not the context. |
 
 ## Files
 
-- `SKILL.md` — full diagnosis and fix guide
-- `references/parameters.md` — tuning guide and diagnostic commands
+- `SKILL.md` — full diagnosis: what, why, how
+- `references/parameters.md` — tuning guide, what to try when base params aren't enough
 
 ## License
 
-MIT
+MIT. Steal it. Fix your models.
