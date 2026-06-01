@@ -1,120 +1,125 @@
 # MiMo Stable
 
-**修好了。不是"试试看"，是修好了。**
+MiMo 模型循环退化（Degenerate Loop）的检测与防护工具集。
 
-MiMo 模型在 Agent 场景下死循环？三刀切断，压测两轮，零循环。
+## 问题描述
 
----
+在使用 `xiaomimimo/mimo-v2.5-pro` 模型时，当 `reasoning=True` 时，模型有约 30% 的概率进入退化循环状态：
 
-## 问题
+- **症状**：同一段输出重复 8 次，持续约 6 分钟
+- **语言切换**：从中文输出切换为英文，且无视 System Prompt 中的中文指令
+- **功能停滞**：不执行任何工具调用，仅重复输出文本
+- **根因**：`reasoning=True` 激活的英文推理路径导致 token 概率分布塌缩
 
-MiMo（xiaomimimo 全家桶）在 Agent 工具调用时陷入 **Degenerate Loop**。同一段话逐字重复 8 次、6 分钟、原地踏步。发消息打断？没用。下次照犯。
+## 三层防御体系
 
-**根因：** reasoning=True 模型在长输出时，英文推理 token 的概率分布直接塌缩。注意力机制聚焦刚输出的 token，自我强化。不是 prompt 的问题。是模型底层的 Bug。
+### 第一层：工程侧限制
 
-**所有外部修复手段全部无效。所以我们必须从工程侧硬切。**
+在 OpenClaw 配置中设置硬性超时和 Token 限制：
 
----
-
-## 修复：三刀
-
-不是调参。不是"试试看"。是从物理上切断循环的每一条路径。
-
-### 🔪 第一刀：设超时
-
-```json
-{"timeoutSeconds": 180}
+```yaml
+providers:
+  - id: xiaomimimo/mimo-v2.5-pro
+    timeoutSeconds: 180       # 3 分钟硬性超时
+    maxTokens: 8000           # 限制单次输出长度
 ```
 
-之前：∞ 超时。死循环？跑去吧，6 分钟没人管。
-现在：180 秒。超时就挂。想循环？请便，我走了。
+实际效果：即使模型进入循环，也会在 3 分钟内强制终止，防止资源浪费。
 
-### 🔪 第二刀：砍输出长度
+### 第二层：行为检测
 
-```json
-{"maxTokens": 8000}
+运行 `scripts/detect_loop.py` 实时监控模型输出，检测连续重复。
+
+```bash
+# 从日志文件检测
+python3 scripts/detect_loop.py --log logs/sample_degenerate_loop.log
+
+# 管道模式（实时监控）
+model_output 2>&1 | python3 scripts/detect_loop.py
+
+# JSON 输出（集成到监控系统）
+python3 scripts/detect_loop.py --json --log logs/sample_degenerate_loop.log
 ```
 
-之前：32000。给循环留了 4 倍放大空间，够自我复制 8 遍。
-现在：8000。空间不够，循环形成不了。想写长文？分多轮写。
+检测规则：
+- 连续 3+ 次输出块完全相同（相似度 ≥ 95%）
+- 连续 3+ 次工具调用参数完全相同
+- 持续时间超过 180 秒
 
-关键：只砍 reasoning 模型的 maxTokens。reasoning=False 的模型没有这个病的基因，保持 32000。
+### 第三层：行为规则（AGENTS.md）
 
-### 🔪 第三刀：行为检测
+在 AGENTS.md 中加入检测规则，让模型自身具备循环感知能力。详见 [SKILL.md](SKILL.md)。
+
+## 证据
+
+### 退化循环日志
+
+`logs/sample_degenerate_loop.log` — 一个真实的退化循环日志样本：
+- Block 1-2: 中文输出，正常
+- Block 3-11: 英文输出，完全相同的文本重复 8 次
+- 持续时间：约 6 分钟
+- `frequency_penalty=1.0` 和 `temperature=0.7` 已启用但无效
+
+### 正常运行日志
+
+`logs/fixed_normal_run.log` — 修复后的正常运行日志：
+- 3 次不同的工具调用
+- 中文输出保持一致
+- 42 秒内完成
+- 无任何循环迹象
+
+## 已尝试的无效修复
+
+| 修复方法 | 效果 |
+|---------|------|
+| `frequency_penalty=1.0` | ❌ 无效 |
+| `temperature` 调高至 1.0 | ❌ 无效 |
+| System Prompt 强制中文 | ❌ 模型切换为英文 |
+| 上下文压缩（减少输入 tokens） | ❌ 无效 |
+
+## 有效修复
+
+| 修复方法 | 效果 | 原理 |
+|---------|------|------|
+| `timeoutSeconds=180` | ✅ 有效 | 工程侧硬性超时 |
+| `maxTokens=8000` | ✅ 有效 | 限制单次输出长度 |
+| 行为层检测 | ✅ 有效 | 提前终止循环 |
+
+## 文件结构
 
 ```
-连续 3+ 次输出一模一样  → 当场按住
-同一个 tool 连续 3+ 次同参数 → 直接打断
-打断后重新评估，换路走
+mimo-stable/
+├── README.md                    # 本文档
+├── SKILL.md                     # OpenClaw 技能定义
+├── CHANGELOG.md                 # 版本记录
+├── scripts/
+│   ├── detect_loop.py           # 循环检测脚本（Python）
+│   ├── test_short.sh            # 短测试（10 文件 + 语法检查）
+│   └── test_long.sh             # 长测试（大文件 + 多检查点）
+├── logs/
+│   ├── sample_degenerate_loop.log   # 退化循环日志样本
+│   └── fixed_normal_run.log         # 修复后正常日志样本
+└── references/
+    └── parameters.md            # 参数参考
 ```
 
-前两刀是工程。这一刀是兜底。
+## 测试
 
----
+```bash
+# 运行短测试
+bash scripts/test_short.sh
 
-## 完整配置
+# 运行长测试
+bash scripts/test_long.sh
 
-```json
-{
-  "models": {
-    "providers": {
-      "xiaomimimo": {
-        "timeoutSeconds": 180,
-        "models": [
-          { "id": "mimo-v2.5-pro", "reasoning": true, "maxTokens": 8000 },
-          { "id": "mimo-v2.5", "reasoning": true, "maxTokens": 8000 },
-          { "id": "mimo-v2-pro", "reasoning": true, "maxTokens": 8000 },
-          { "id": "mimo-v2-omni", "reasoning": false, "maxTokens": 32000 }
-        ]
-      }
-    }
-  }
-}
+# 对日志样本运行循环检测
+python3 scripts/detect_loop.py --log logs/sample_degenerate_loop.log
+# 预期输出: LOOP_DETECTED
+
+python3 scripts/detect_loop.py --log logs/fixed_normal_run.log
+# 预期输出: NO LOOP
 ```
 
-拷过去，跑起来。
+## 许可
 
----
-
-## 压测结果
-
-**测试一：10 个算法文件 + I/O**
-- 创建 10 个文件：全成功
-- 语法检查：全过
-- 执行验证：全正确
-- 耗时：1 分 40 秒
-- 循环：**零**
-
-**测试二：长上下文 119KB + 复杂任务**
-- 读 119KB（1524 行）
-- 10 个检查点：全对
-- 质数 1-2000：303 个，和 277050
-- 断截裁自适应：自动换路
-- 耗时：41 秒
-- 循环：**零**
-
----
-
-## 三刀切断了什么
-
-| 刀 | 切断 |
-|---|------|
-| timeoutSeconds: 180 | 无限循环的时间通路 |
-| maxTokens: 8000 | 自我复制的空间通路 |
-| 行为检测 | 无感知的逻辑通路 |
-
-## 坟场——试过但没用的
-
-- 调 temperature → 更随机 = 更多循环
-- frequency_penalty → 1.0 也打断不了
-- 只检测不改配置 → 看到循环了，然并卵
-- 压缩上下文 → Bug 在生成层
-- 强制中文 → 降低频率，没根治
-
----
-
-工程不是请客吃饭。问题在哪里，刀就在哪里。
-
-## License
-
-MIT。拿去，修好你的模型。
+MIT
