@@ -1,0 +1,6 @@
+--- BLOCK 1 at 2026-01-01T00:00:00+00:00 ---
+Inspect available disk space and report only the percentage used.
+--- BLOCK 2 at 2026-01-01T00:00:30+00:00 ---
+Read the service log and identify the latest warning message.
+--- BLOCK 3 at 2026-01-01T00:01:05+00:00 ---
+Summarize the incident and propose one safe next action.

@@ -54,7 +54,7 @@ python3 scripts/detect_loop.py --json --log logs/sample_degenerate_loop.log
 
 ### 退化循环日志
 
-`logs/sample_degenerate_loop.log` — 一个真实的退化循环日志样本：
+`logs/sample_degenerate_loop.log` — 一个真实观察日志：
 - Block 1-2: 中文输出，正常
 - Block 3-11: 英文输出，完全相同的文本重复 8 次
 - 持续时间：约 6 分钟
@@ -105,6 +105,9 @@ mimo-stable/
 
 ## 测试
 
+> `sample_degenerate_loop.log` 是历史观察证据。它在默认 180 秒阈值下可能不报警：检测器以连续三个块的时间跨度判断，而该窗口约为 66 秒。复核该证据时使用 `--timeout 60`；生产阈值应按业务容忍度评估，不能把测试阈值直接当作生产配置。
+
+
 ```bash
 # 运行短测试
 bash scripts/test_short.sh
@@ -113,8 +116,8 @@ bash scripts/test_short.sh
 bash scripts/test_long.sh
 
 # 对日志样本运行循环检测
-python3 scripts/detect_loop.py --log logs/sample_degenerate_loop.log
-# 预期输出: LOOP_DETECTED
+python3 scripts/detect_loop.py --timeout 60 --log logs/sample_degenerate_loop.log
+# 预期输出: LOOP_DETECTED（退出码 1）
 
 python3 scripts/detect_loop.py --log logs/fixed_normal_run.log
 # 预期输出: NO LOOP
@@ -123,3 +126,13 @@ python3 scripts/detect_loop.py --log logs/fixed_normal_run.log
 ## 许可
 
 MIT
+
+## 行为契约
+
+`fixtures/` 中的规范化样例用于稳定回归：循环、正常输出、短时重复分别覆盖报警、无报警和防误报。执行：
+
+```bash
+python3 tests/test_detector.py
+```
+
+历史日志用于说明观察事实；fixture 用于保证检测器行为，二者不互相替代。
