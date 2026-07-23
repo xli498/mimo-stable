@@ -104,15 +104,11 @@ class LoopDetector:
     def _log(self, level: str, message: str):
         """Output a log message."""
         timestamp = datetime.now().isoformat()
-        if self.json_output and level != "INFO":
-            entry = {
-                "timestamp": timestamp,
-                "level": level,
-                "message": message,
-            }
-            print(json.dumps(entry, ensure_ascii=False), flush=True)
-        else:
-            print(f"[{timestamp}] [{level}] {message}", flush=True)
+        # --json is a machine-readable contract: emit exactly one final summary
+        # document from main(), never interleave event records with it.
+        if self.json_output:
+            return
+        print(f"[{timestamp}] [{level}] {message}", flush=True)
 
     def process_block(self, text: str, block_time: float | None = None):
         """Process a single output block from the model.
