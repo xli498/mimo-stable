@@ -30,6 +30,7 @@ Exit codes:
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -38,6 +39,15 @@ from collections import deque
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
+
+
+# Repeating any external action is riskier than repeating a read-only action.
+# This set is intentionally conservative: unknown tools retain the normal
+# three-repeat rule rather than being guessed as side-effecting.
+SIDE_EFFECT_TOOLS = {
+    "send", "write", "edit", "delete", "remove", "payment", "pay",
+    "purchase", "post", "publish", "create", "submit",
+}
 
 
 class LoopDetector:
@@ -49,11 +59,13 @@ class LoopDetector:
         time_threshold: int = 180,
         similarity_threshold: float = 0.95,
         json_output: bool = False,
+        expected_language: str | None = None,
     ):
         self.repeat_threshold = repeat_threshold
         self.time_threshold = time_threshold
         self.similarity_threshold = similarity_threshold
         self.json_output = json_output
+        self.expected_language = expected_language
 
         # State
         self.blocks: deque = deque(maxlen=max(repeat_threshold + 5, 20))
@@ -66,6 +78,18 @@ class LoopDetector:
     def _similarity(self, a: str, b: str) -> float:
         """Compute similarity ratio between two strings."""
         return SequenceMatcher(None, a, b).ratio()
+
+    @staticmethod
+    def _params_hash(params: str) -> str:
+        """Return a stable, non-reversible identifier for logging only."""
+        return hashlib.sha256(params.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _looks_english(text: str) -> bool:
+        """Conservative language-drift heuristic for an explicitly Chinese task."""
+        latin = len(re.findall(r"[A-Za-z]", text))
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+        return latin >= 10 and cjk == 0
 
     def _extract_tool_calls(self, text: str) -> list[dict]:
         """Extract tool call signatures from model output text.
@@ -132,6 +156,22 @@ class LoopDetector:
         for t in tools:
             self.tool_calls.append(t)
 
+        # A configured Chinese task that repeatedly produces English-only
+        # output is an actionable drift signal. It is opt-in because language
+        # cannot be inferred safely from an arbitrary log.
+        if self.expected_language == "zh" and len(self.blocks) >= self.repeat_threshold:
+            recent_blocks = list(self.blocks)[-self.repeat_threshold:]
+            if all(self._looks_english(block) for block in recent_blocks):
+                self.loop_detected = True
+                self.loop_reason = "Detected repeated English-only output in a Chinese task"
+                self.loop_details = {
+                    "type": "language_drift",
+                    "expected_language": "zh",
+                    "repeats": len(recent_blocks),
+                }
+                self._log("LOOP_DETECTED", self.loop_reason)
+                return
+
         # --- Rule 1: Consecutive identical output blocks ---
         if len(self.blocks) >= self.repeat_threshold:
             recent = list(self.blocks)[-self.repeat_threshold:]
@@ -177,13 +217,32 @@ class LoopDetector:
                 self.loop_details = {
                     "type": "identical_tool_calls",
                     "tool": name,
-                    "params": params[:200],
+                    "params_hash": self._params_hash(params),
                     "repeats": len(recent_tools),
                 }
                 self._log(
                     "LOOP_DETECTED",
-                    f"{self.loop_reason}\n  Params: {self.loop_details['params']}",
+                    f"{self.loop_reason}\n  Params hash: {self.loop_details['params_hash']}",
                 )
+
+        # External side effects must not be retried blindly. Two identical
+        # attempts are enough to stop and require a fresh safety review.
+        if len(self.tool_calls) >= 2:
+            previous, current = list(self.tool_calls)[-2:]
+            if (
+                previous["name"] == current["name"]
+                and previous["params"] == current["params"]
+                and current["name"] in SIDE_EFFECT_TOOLS
+            ):
+                self.loop_detected = True
+                self.loop_reason = f"Detected repeated side-effecting tool call: {current['name']}"
+                self.loop_details = {
+                    "type": "repeated_side_effect_tool_call",
+                    "tool": current["name"],
+                    "params_hash": self._params_hash(current["params"]),
+                    "repeats": 2,
+                }
+                self._log("LOOP_DETECTED", self.loop_reason)
 
     def reset(self):
         """Reset detector state."""
@@ -305,6 +364,11 @@ Examples:
         action="store_true",
         help="Output results in JSON format",
     )
+    parser.add_argument(
+        "--expect-language",
+        choices=["zh"],
+        help="Enable language-drift detection for an explicitly Chinese task",
+    )
     args = parser.parse_args()
 
     # Create detector
@@ -313,6 +377,7 @@ Examples:
         time_threshold=args.timeout,
         similarity_threshold=args.similarity,
         json_output=args.json,
+        expected_language=args.expect_language,
     )
 
     # Read input
@@ -357,7 +422,10 @@ Examples:
             elif details.get("type") == "identical_tool_calls":
                 print(f"  Tool:             {details.get('tool')}")
                 print(f"  Repeats:          {details.get('repeats')}")
-                print(f"  Params:           {details.get('params', 'N/A')}")
+                print(f"  Params hash:      {details.get('params_hash', 'N/A')}")
+            elif details.get("type") == "repeated_side_effect_tool_call":
+                print(f"  Tool:             {details.get('tool', 'N/A')}")
+                print("  Action:           pause and re-check before retrying")
         print(f"{'=' * 60}")
 
     sys.exit(1 if summary["loop_detected"] else 0)
