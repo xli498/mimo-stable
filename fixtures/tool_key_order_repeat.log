@@ -1,0 +1,6 @@
+--- BLOCK 1 at 2026-01-01T00:00:00+00:00 ---
+{"name":"read","parameters":{"path":"a.txt","text":"sensitive-demo"}}
+--- BLOCK 2 at 2026-01-01T00:00:10+00:00 ---
+{"name":"read","parameters":{"text":"sensitive-demo","path":"a.txt"}}
+--- BLOCK 3 at 2026-01-01T00:00:20+00:00 ---
+{"name":"read","parameters":{"path":"a.txt","text":"sensitive-demo"}}
