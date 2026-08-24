@@ -2,7 +2,14 @@
 
 ## Reporting a vulnerability
 
-Do **not** publish credentials, private URLs, or exploit details in a public issue. Report a concise description, affected version or commit, reproduction conditions, and impact through the repository owner's private contact channel.
+Do **not** publish credentials, private URLs, private prompts, raw tool payloads,
+or exploit details in a public issue.
+
+If GitHub private vulnerability reporting is enabled for this repository, use the
+repository's **Security → Report a vulnerability** entry. Otherwise, contact the
+repository owner privately before disclosing technical details. Include a concise
+description, affected version or commit, reproduction conditions, impact, and any
+redacted proof of concept.
 
 ## Scope
 

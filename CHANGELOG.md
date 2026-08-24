@@ -27,10 +27,10 @@ All notable changes to LLM Degenerate Loop Guardrails.
 - `scripts/test_short.sh` — 短测试脚本（10 文件 + 语法 + 执行验证）
 - `scripts/test_long.sh` — 长测试脚本（50KB 文件 + 多检查点 + 模式搜索）
 - `logs/sample_degenerate_loop.log` — 退化循环日志样本（8 次重复，6 分钟）
-- `logs/fixed_normal_run.log` — 修复后正常日志样本（3 次工具调用，42 秒）
+- `logs/fixed_normal_run.log` — 一次正常运行日志样本（3 次工具调用，42 秒）
 - `SKILL.md` — 技能定义，包含检测规则和 AGENTS.md 模板
 - `CHANGELOG.md` — 本文件
-- `references/parameters.md` — MiMo 模型参数参考
+- `references/parameters.md` — 历史参数观察记录
 
 ### Changed
 - `README.md` — 重写为技术文档风格
@@ -44,7 +44,14 @@ All notable changes to LLM Degenerate Loop Guardrails.
 
 ## [Unreleased]
 
-### Planned
+### Changed
++- 明确源码本地安装边界，并将 MiMo 配置示例标注为历史案例而非通用推荐。
++- 补充贡献、安全报告、Issue 和 PR 的隐私与证据边界要求。
++
++### Added
++- 安装后 CLI smoke test、包版本与 CHANGELOG 一致性检查，以及对应 CI 校验。
++
++### Planned
 - 收集脱敏的跨模型案例，并按模型/端点/参数分组比较
 - 增加可选的真实运行日志适配器，但不保存密钥和敏感工具参数
 - 在有足够样本后再报告限定条件下的误报、漏报和检测延迟

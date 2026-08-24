@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose a focused improvement with its safety and evidence boundary.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Evidence and safety boundary
+      description: Explain fixtures, false-positive/false-negative risk, and whether the proposal could add side effects.
+    validations:
+      required: true

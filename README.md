@@ -48,11 +48,16 @@ python3 scripts/detect_loop.py --json --timeout 60 --log fixtures/loop_detected.
 在运行器中设置硬性超时和 Token 限制（具体字段以所用框架官方文档为准）：
 
 ```yaml
-providers:
-  - id: xiaomimimo/mimo-v2.5-pro
-    timeoutSeconds: 180       # 3 分钟硬性超时
-    maxTokens: 8000           # 限制单次输出长度
+# 示例结构；字段名和数值必须按实际框架、模型与任务校准。
+provider:
+  model: <your-model>
+  timeout: <task-specific-limit>
+  max_tokens: <task-specific-limit>
 ```
+
+> **历史案例，不是通用推荐：** 最初 MiMo 案例曾使用
+> `timeoutSeconds=180` 和 `maxTokens=8000` 限制单次资源占用。这些值不是
+> 跨模型配置建议，也不表示能够改变模型进入循环的概率。
 
 作用是限制单次故障的最长资源占用，不改变模型本身的循环概率。
 
@@ -165,8 +170,8 @@ bash scripts/test_long.sh
 
 ## 安装与集成
 
-项目保持零运行时依赖，直接运行脚本最稳妥。仓库提供 `pyproject.toml` 作为后续
-打包入口；在正式包结构和发布流程完成前，不把 PyPI 安装描述为稳定接口。
+项目保持零运行时依赖，直接运行脚本最稳妥。当前支持**从源码本地安装**，但尚未
+发布到 PyPI；请不要使用 `pip install mimo-stable` 获取公共发行包。
 
 本地验证安装入口：
 

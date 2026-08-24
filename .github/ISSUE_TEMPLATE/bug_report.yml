@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible detector, CLI, or documentation defect.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include credentials, private prompts, user data, raw production tool payloads, or private endpoints."
+  - type: input
+    id: version
+    attributes:
+      label: Project version or commit
+      placeholder: "v1.1.0 or 25fcb4e"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal redacted reproduction
+      description: Include the command, synthetic/redacted fixture, expected result, and actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, OS, integration/runtime, and model/endpoint only if relevant and safe to share.
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, private URLs, private prompts, and sensitive tool parameters.
+          required: true
