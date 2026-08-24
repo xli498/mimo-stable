@@ -1,5 +1,10 @@
 # LLM Degenerate Loop Guardrails
 
+[![Quality Gate](https://github.com/xli498/mimo-stable/actions/workflows/quality.yml/badge.svg)](https://github.com/xli498/mimo-stable/actions/workflows/quality.yml)
+[![Release](https://img.shields.io/github/v/release/xli498/mimo-stable)](https://github.com/xli498/mimo-stable/releases)
+[![License](https://img.shields.io/github/license/xli498/mimo-stable)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+
 面向国产及其他 LLM 的输出流和工具调用退化循环经验记录与检测工具。
 项目最初来自 MiMo `reasoning=True` 场景的重复输出观察，后来发现类似现象
 也可能出现在 GLM 等其他模型中。这里分享的是识别、止损和复盘方法，不是
@@ -26,6 +31,11 @@
 
 ## 30 秒开始
 
+![Guardrails architecture](docs/architecture.svg)
+
+> **核心流程：** 模型输出 → 检测信号 → 保守决策摘要 → 上层运行器处理。
+> 检测器和恢复层都不执行重试、模型切换或工具调用。
+
 ```bash
 python3 scripts/detect_loop.py --log fixtures/loop_detected.log
 python3 tests/test_detector.py
@@ -42,6 +52,23 @@ python3 scripts/detect_loop.py --json --timeout 60 --log fixtures/loop_detected.
 python3 scripts/detect_loop.py --json --timeout 60 --log fixtures/loop_detected.log | \
   python3 scripts/recovery_policy.py --retryable
 ```
+
+典型检测摘要：
+
+```json
+{
+  "loop_detected": true,
+  "details": {
+    "type": "consecutive_identical_output"
+  }
+}
+```
+
+| 退出码 | 含义 |
+| :---: | :--- |
+| `0` | 未检测到循环 |
+| `1` | 检测到循环 |
+| `2` | 参数或输入错误 |
 
 ## 问题描述
 
@@ -190,15 +217,25 @@ bash scripts/test_long.sh
 
 ## 安装与集成
 
-项目保持零运行时依赖，直接运行脚本最稳妥。当前支持**从源码本地安装**，但尚未
-发布到 PyPI；请不要使用 `pip install mimo-stable` 获取公共发行包。
+项目保持零运行时依赖。当前支持源码直接运行和本地 CLI 安装，尚未发布到 PyPI。
 
-本地验证安装入口：
+### 方式一：直接运行源码
+
+```bash
+git clone https://github.com/xli498/mimo-stable.git
+cd mimo-stable
+python3 scripts/detect_loop.py --log fixtures/loop_detected.log
+```
+
+### 方式二：安装本地 CLI
 
 ```bash
 python3 -m pip install --no-deps .
 mimo-loop-detect --json --timeout 60 --log fixtures/loop_detected.log
 ```
+
+> [!NOTE]
+> 当前尚未发布公共 PyPI 包，因此不要使用 `pip install mimo-stable` 获取发行包。
 
 上层运行器不应在检测到循环后盲目重试：
 
