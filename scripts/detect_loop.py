@@ -104,22 +104,28 @@ class LoopDetector:
         """
         calls = []
 
-        # Pattern: JSON-style tool calls
-        # Match blocks like: {"name": "read", "parameters": {"path": "foo"}}
-        json_tool_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*(\{[^}]+\})\s*\}'
-        for match in re.finditer(json_tool_pattern, text, re.DOTALL):
+        # Parse JSON objects rather than matching braces. Tool parameters may
+        # legitimately contain nested objects, arrays, or escaped strings.
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r'\{', text):
             try:
-                params_str = match.group(2)
-                params = json.loads(params_str)
-                calls.append({
-                    "name": match.group(1),
-                    "params": json.dumps(params, sort_keys=True),
-                })
-            except json.JSONDecodeError:
+                candidate, _ = decoder.raw_decode(text[match.start():])
+            except (json.JSONDecodeError, ValueError):
                 pass
+            else:
+                if (
+                    isinstance(candidate, dict)
+                    and isinstance(candidate.get("name"), str)
+                    and isinstance(candidate.get("parameters"), dict)
+                ):
+                    calls.append({
+                        "name": candidate["name"],
+                        "params": json.dumps(candidate["parameters"], sort_keys=True),
+                    })
 
-        # Pattern: function-like calls
-        func_pattern = r'(read|write|exec|edit|browser|web_fetch)\s*\(([^)]*)\)'
+        # Function-style calls must begin a line. This avoids treating normal
+        # prose such as "I will edit (the draft)" as an actual tool invocation.
+        func_pattern = r'^\s*(read|write|exec|edit|browser|web_fetch)\s*\(([^)]*)\)'
         for match in re.finditer(func_pattern, text, re.IGNORECASE):
             tool = match.group(1).lower()
             args = match.group(2).strip()
