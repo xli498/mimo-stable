@@ -2,6 +2,16 @@
 
 All notable changes to LLM Degenerate Loop Guardrails.
 
+## [1.1.1] - 2026-08-24
+
+### Added
+- Added an English project overview with architecture, installation, and integration guidance.
+- Added explicit PyPI Trusted Publishing workflow for reproducible package releases.
+- Added public integration examples and release-quality documentation.
+
+### Fixed
+- Aligned the published package workflow with the public `main` branch and Python 3.10+ metadata.
+
 ## [1.1.0] - 2026-08-24
 
 ### Changed
