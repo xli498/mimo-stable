@@ -25,6 +25,18 @@ run("near_duplicate_below_threshold.log",0,False)
 run("tool_key_order_repeat.log",1,True, forbidden=("sensitive-demo",))
 run("side_effect_repeat.log",1,True, forbidden=("sensitive-demo",))
 run("language_drift_zh.log",1,True, extra_args=("--expect-language","zh"))
+# Ordinary prose that mentions a tool name must not be parsed as a tool call.
+prose=(
+    "I will edit (the first draft) now.\n\n"
+    "Next I will edit (the release notes) for clarity.\n\n"
+    "Finally I will edit (the checklist) before review.\n\n"
+)
+p=subprocess.run([sys.executable,str(DETECTOR),"--json","--text-mode","instant"],input=prose,capture_output=True,text=True)
+assert p.returncode == 0 and json.loads(p.stdout)["loop_detected"] is False, (p.stdout,p.stderr)
+# Nested JSON parameters remain a single stable call signature.
+nested='{"name":"exec","parameters":{"cmd":{"query":"status"},"flags":["--json"]}}\n\n'
+p=subprocess.run([sys.executable,str(DETECTOR),"--json","--text-mode","instant"],input=nested * 3,capture_output=True,text=True)
+assert p.returncode == 1 and json.loads(p.stdout)["details"]["type"] == "identical_tool_calls", (p.stdout,p.stderr)
 # Instant mode is opt-in; it separates immediate repetition signals from
 # the default duration-gated policy used for conservative post-processing.
 run("repeated_but_short.log",1,True, extra_args=("--text-mode", "instant"))
