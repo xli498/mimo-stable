@@ -16,17 +16,19 @@ author: xli498
 以下只是某个历史案例的参考，不是 MiMo、GLM 或其他模型的通用修复配置。
 字段名称和行为必须以实际运行器/供应商官方文档为准。
 
-在模型配置中添加以下设置：
+在运行器中配置任务级的资源上限。字段名和行为必须以实际运行器/供应商
+官方文档为准：
 
 ```yaml
-# openclaw.yaml
-providers:
-  - id: xiaomimimo/mimo-v2.5-pro
-    api: https://api.xiaomimimo.com/v1
-    timeoutSeconds: 180        # 3 分钟硬性超时
-    maxTokens: 8000            # 限制单次输出长度
-    # 参数效果需要按模型、端点和任务单独验证
+# 示例结构，不是可直接粘贴到某个框架的配置
+runtime:
+  timeout: <task-specific-limit>
+  max_output_tokens: <task-specific-limit>
 ```
+
+历史 MiMo 案例曾使用过 `timeoutSeconds=180`、`maxTokens=8000` 和
+`reasoning=True`。这些字段和值只用于记录当时的运行条件，不能直接外推到
+其他模型、端点或框架，也不表示能够修复模型循环。
 
 ## AGENTS.md 行为规则
 
@@ -58,25 +60,21 @@ providers:
 ### 方式一：管道监控
 
 ```bash
-# 在启动模型服务时传入管道
-openclaw agent run --model xiaomimimo/mimo-v2.5-pro 2>&1 | \
+# 将上层运行器输出的脱敏块流交给检测器；空行分隔输出块
+your_runner_command 2>&1 | \
   python3 scripts/detect_loop.py --threshold 3 --timeout 180
 ```
 
 ### 方式二：日志后处理
 
 ```bash
-# 定期检查日志
-python3 scripts/detect_loop.py --log /var/log/openclaw/session.log --json | \
-  python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(1 if d['loop_detected'] else 0)"
+# 对一个脱敏日志快照做后处理；不要把多个 JSON 摘要直接 append 到同一文件
+python3 scripts/detect_loop.py --log /path/to/redacted-session.log --json > /tmp/loop-summary.json
+python3 -c "import json,sys; d=json.load(open('/tmp/loop-summary.json')); sys.exit(1 if d['loop_detected'] else 0)"
 ```
 
-### 方式三：cron 监控
-
-```bash
-# 每 5 分钟检查一次
-*/5 * * * * cd /path/to/mimo-stable && python3 scripts/detect_loop.py --log /var/log/openclaw/current.log --json >> /var/log/loop_check.json
-```
+如需周期监控，应由上层调度器管理快照、幂等记录和告警；本项目不提供 cron
+配置，也不会自动停止模型、切换模型、重试请求或调用工具。
 
 ## 检测规则详解
 
