@@ -5,7 +5,15 @@ from __future__ import annotations
 
 import re
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 compatibility
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "Python 3.10 requires the optional 'tomli' package to run check_version.py"
+        ) from exc
 from pathlib import Path
 
 
