@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mimo-stable"
-version = "1.1.3"
+version = "1.1.4"
 description = "Record, detect, and apply engineering guardrails for degenerate loops in LLM output and tool calls"
 readme = "README.en.md"
 requires-python = ">=3.10"
@@ -20,14 +20,15 @@ classifiers = [
   "Topic :: Software Development :: Quality Assurance",
 ]
 
+license = {file = "LICENSE"}
+authors = [{name = "xli498"}]
+dependencies = []
+
 [project.urls]
 Homepage = "https://github.com/xli498/mimo-stable"
 Repository = "https://github.com/xli498/mimo-stable"
 Changelog = "https://github.com/xli498/mimo-stable/blob/main/CHANGELOG.md"
 Issues = "https://github.com/xli498/mimo-stable/issues"
-license = {file = "LICENSE"}
-authors = [{name = "xli498"}]
-dependencies = []
 
 [project.scripts]
 mimo-loop-detect = "scripts.detect_loop:main"

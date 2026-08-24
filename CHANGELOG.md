@@ -2,6 +2,11 @@
 
 All notable changes to LLM Degenerate Loop Guardrails.
 
+## [1.1.4] - 2026-08-24
+
+### Fixed
+- Corrected the `pyproject.toml` project metadata layout so isolated builds and PyPI publishing validate successfully.
+
 ## [1.1.3] - 2026-08-24
 
 ### Fixed
