@@ -13,4 +13,5 @@ build/
 venv/
 env/
 *.log
+!fixtures/*.log
 .DS_Store

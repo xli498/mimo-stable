@@ -1,0 +1,10 @@
+--- BLOCK 1 at 2026-01-01T00:00:00+00:00 ---
+{"name":"read","parameters":{"path":"a.txt"}}
+--- BLOCK 2 at 2026-01-01T00:00:10+00:00 ---
+The tool result was received; assess whether another read is necessary.
+--- BLOCK 3 at 2026-01-01T00:00:20+00:00 ---
+{"name":"read","parameters":{"path":"a.txt"}}
+--- BLOCK 4 at 2026-01-01T00:00:30+00:00 ---
+The second observation is consistent with the first.
+--- BLOCK 5 at 2026-01-01T00:00:40+00:00 ---
+{"name":"read","parameters":{"path":"a.txt"}}

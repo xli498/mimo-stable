@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MiMo Stable — Degenerate Loop Detection Script
+LLM Degenerate Loop Guardrails — Detection Script
 
 Detects degenerate loops in model output streams where the model
 repeatedly emits identical or near-identical text blocks.
@@ -58,19 +58,22 @@ class LoopDetector:
         repeat_threshold: int = 3,
         time_threshold: int = 180,
         similarity_threshold: float = 0.95,
+        text_mode: str = "duration",
         json_output: bool = False,
         expected_language: str | None = None,
     ):
         self.repeat_threshold = repeat_threshold
         self.time_threshold = time_threshold
         self.similarity_threshold = similarity_threshold
+        self.text_mode = text_mode
         self.json_output = json_output
         self.expected_language = expected_language
 
         # State
-        self.blocks: deque = deque(maxlen=max(repeat_threshold + 5, 20))
-        self.tool_calls: deque = deque(maxlen=max(repeat_threshold + 5, 20))
-        self.block_timestamps: list[float] = []
+        window_size = max(repeat_threshold + 5, 20)
+        self.blocks: deque = deque(maxlen=window_size)
+        self.tool_calls: deque = deque(maxlen=window_size)
+        self.block_timestamps: deque = deque(maxlen=window_size)
         self.loop_detected = False
         self.loop_reason = ""
         self.loop_details: dict = {}
@@ -151,8 +154,12 @@ class LoopDetector:
         self.blocks.append(text)
         self.block_timestamps.append(block_time)
 
-        # Extract tool calls
+        # Tool calls must be consecutive output events. A normal model/result
+        # block between calls is evidence of progress, so do not carry an old
+        # call across it when evaluating a call-loop.
         tools = self._extract_tool_calls(text)
+        if not tools:
+            self.tool_calls.clear()
         for t in tools:
             self.tool_calls.append(t)
 
@@ -185,7 +192,7 @@ class LoopDetector:
             if identical:
                 duration = block_time - self.block_timestamps[-self.repeat_threshold]
                 # Also check duration threshold (default 3 min)
-                if duration >= self.time_threshold:
+                if self.text_mode == "instant" or duration >= self.time_threshold:
                     self.loop_detected = True
                     self.loop_reason = (
                         f"Detected {self.repeat_threshold}+ consecutive identical "
@@ -193,6 +200,7 @@ class LoopDetector:
                     )
                     self.loop_details = {
                         "type": "consecutive_identical_output",
+                        "signal": "instant" if self.text_mode == "instant" else "duration_gated",
                         "repeats": len(recent),
                         "duration_seconds": duration,
                         "sample": base[:200] + ("..." if len(base) > 200 else ""),
@@ -304,29 +312,30 @@ def read_from_file(filepath: str) -> list[tuple[str, float]]:
     return blocks
 
 
-def read_from_stdin() -> list[tuple[str, float]]:
-    """Read blocks from stdin. Blocks are separated by blank lines or
-    a configurable delimiter."""
-    blocks = []
+def iter_from_stdin():
+    """Yield stdin blocks as they close, preserving their arrival time.
+
+    Processing must happen during iteration. Collecting all of stdin before
+    evaluating blocks would assign nearly identical timestamps and invalidate
+    duration-gated detection for real streamed output.
+    """
     current_block: list[str] = []
 
     for line in sys.stdin:
         if line.strip() == "":
             if current_block:
-                blocks.append(("\n".join(current_block), time.time()))
+                yield "\n".join(current_block), time.time()
                 current_block = []
         else:
             current_block.append(line.rstrip("\n"))
 
     if current_block:
-        blocks.append(("\n".join(current_block), time.time()))
-
-    return blocks
+        yield "\n".join(current_block), time.time()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MiMo Stable — Degenerate Loop Detection",
+        description="LLM Degenerate Loop Guardrails — Detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -354,6 +363,15 @@ Examples:
         help="Minimum duration in seconds for loop detection (default: 180, i.e. 3 min)",
     )
     parser.add_argument(
+        "--text-mode",
+        choices=["duration", "instant"],
+        default="duration",
+        help=(
+            "Text-repeat policy: duration requires --timeout; instant triggers "
+            "after the repeat threshold (default: duration)"
+        ),
+    )
+    parser.add_argument(
         "--similarity",
         type=float,
         default=0.95,
@@ -371,38 +389,50 @@ Examples:
     )
     args = parser.parse_args()
 
+    if args.threshold < 2:
+        parser.error("--threshold must be at least 2")
+    if args.timeout < 0:
+        parser.error("--timeout must be non-negative")
+    if not 0.0 <= args.similarity <= 1.0:
+        parser.error("--similarity must be between 0 and 1")
+
     # Create detector
     detector = LoopDetector(
         repeat_threshold=args.threshold,
         time_threshold=args.timeout,
         similarity_threshold=args.similarity,
+        text_mode=args.text_mode,
         json_output=args.json,
         expected_language=args.expect_language,
     )
 
     # Read input
+    start_time = time.time()
+    total_blocks = 0
     if args.log:
         blocks = read_from_file(args.log)
+        for text, ts in blocks:
+            total_blocks += 1
+            detector.process_block(text, ts)
+            if detector.loop_detected:
+                break
     else:
-        blocks = read_from_stdin()
+        for text, ts in iter_from_stdin():
+            total_blocks += 1
+            detector.process_block(text, ts)
+            if detector.loop_detected:
+                break
 
-    if not blocks:
+    if total_blocks == 0:
         print("Warning: No input blocks found", file=sys.stderr)
         if args.json:
             print(json.dumps({"error": "no_input"}))
-        sys.exit(0)
-
-    # Process blocks
-    start_time = time.time()
-    for text, ts in blocks:
-        detector.process_block(text, ts)
-        if detector.loop_detected:
-            break
+        sys.exit(2)
 
     # Output summary
     summary = detector.summary()
     summary["elapsed_seconds"] = time.time() - start_time
-    summary["total_blocks"] = len(blocks)
+    summary["total_blocks"] = total_blocks
 
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -410,7 +440,7 @@ Examples:
         print(f"\n{'=' * 60}")
         print(f"Loop Detection Summary")
         print(f"{'=' * 60}")
-        print(f"  Blocks processed: {len(blocks)}")
+        print(f"  Blocks processed: {total_blocks}")
         print(f"  Loop detected:    {'YES ⚠️' if summary['loop_detected'] else 'NO ✅'}")
         if summary["loop_detected"]:
             print(f"  Reason:           {summary['reason']}")
