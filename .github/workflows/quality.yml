@@ -24,3 +24,4 @@ jobs:
           python -m py_compile scripts/*.py
           bash -n scripts/*.sh
           python3 tests/test_detector.py
+          python3 scripts/benchmark_fixtures.py
