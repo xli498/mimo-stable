@@ -94,16 +94,16 @@ cd mimo-stable
 python3 scripts/detect_loop.py --log fixtures/loop_detected.log
 ```
 
-### Install the local CLI
+### Install the CLI from PyPI
 
 ```bash
-python3 -m pip install --no-deps .
+python3 -m pip install mimo-stable
 mimo-loop-detect --json --timeout 60 --log fixtures/loop_detected.log
 ```
 
 > [!NOTE]
-> The project is not currently published as a public PyPI package. Do not use
-> `pip install mimo-stable` as a public-package installation command yet.
+> `mimo-stable` provides the `mimo-loop-detect` command-line tool. It does not
+> currently provide a Python import API named `mimo_stable`.
 
 ## Examples
 

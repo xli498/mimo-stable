@@ -230,7 +230,7 @@ bash scripts/test_long.sh
 
 ## 安装与集成
 
-项目保持零运行时依赖。当前支持源码直接运行和本地 CLI 安装，尚未发布到 PyPI。
+项目保持零运行时依赖。支持通过 PyPI 安装 CLI，也支持源码直接运行。
 
 ### 方式一：直接运行源码
 
@@ -240,15 +240,15 @@ cd mimo-stable
 python3 scripts/detect_loop.py --log fixtures/loop_detected.log
 ```
 
-### 方式二：安装本地 CLI
+### 方式二：从 PyPI 安装 CLI
 
 ```bash
-python3 -m pip install --no-deps .
+python3 -m pip install mimo-stable
 mimo-loop-detect --json --timeout 60 --log fixtures/loop_detected.log
 ```
 
 > [!NOTE]
-> 当前尚未发布公共 PyPI 包，因此不要使用 `pip install mimo-stable` 获取发行包。
+> `mimo-stable` 提供命令行工具 `mimo-loop-detect`。当前不提供名为 `mimo_stable` 的 Python 导入 API。
 
 上层运行器不应在检测到循环后盲目重试：
 

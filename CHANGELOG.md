@@ -2,6 +2,12 @@
 
 All notable changes to LLM Degenerate Loop Guardrails.
 
+## [1.1.2] - 2026-08-24
+
+### Fixed
+- Corrected the Chinese and English installation guidance to document the published PyPI CLI package.
+- Clarified that the distribution provides the `mimo-loop-detect` CLI and does not currently expose a `mimo_stable` Python import API.
+
 ## [1.1.1] - 2026-08-24
 
 ### Added
