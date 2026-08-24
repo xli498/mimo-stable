@@ -5,8 +5,24 @@
 也可能出现在 GLM 等其他模型中。这里分享的是识别、止损和复盘方法，不是
 针对任何模型的根治方案。
 
+> [!IMPORTANT]
 > 当前项目的核心能力是**检测与止损**，不是自动修复模型。检测到循环后，
 > 由上层运行器决定停止、切换模型、重试或人工复核。
+
+## 目录
+
+- [30 秒开始](#30-秒开始)
+- [问题描述](#问题描述)
+- [三层防御体系](#三层防御体系)
+- [检测策略](#检测策略)
+- [可复现证据](#可复现证据)
+- [如何记录和分享新案例](#如何记录和分享新案例)
+- [工程侧缓解措施](#工程侧缓解措施不是模型修复)
+- [文件结构](#文件结构)
+- [测试](#测试)
+- [安装与集成](#安装与集成)
+- [许可](#许可)
+- [行为契约](#行为契约)
 
 ## 30 秒开始
 
@@ -55,6 +71,7 @@ provider:
   max_tokens: <task-specific-limit>
 ```
 
+> [!WARNING]
 > **历史案例，不是通用推荐：** 最初 MiMo 案例曾使用
 > `timeoutSeconds=180` 和 `maxTokens=8000` 限制单次资源占用。这些值不是
 > 跨模型配置建议，也不表示能够改变模型进入循环的概率。
@@ -103,6 +120,9 @@ python3 scripts/detect_loop.py --text-mode instant --log fixtures/repeated_but_s
 
 ## 可复现证据
 
+> [!NOTE]
+> Fixture 用于稳定回归，历史日志用于记录具体观察；两者的证据性质不同。
+
 `logs/sample_degenerate_loop.log` 是历史观察日志；`logs/fixed_normal_run.log`
 是一次正常运行日志。它们只说明具体案例，不构成模型故障率统计，也不证明
 任何参数能“修复”模型。
@@ -127,7 +147,7 @@ python3 scripts/detect_loop.py --text-mode instant --log fixtures/repeated_but_s
 ## 工程侧缓解措施（不是模型修复）
 
 | 措施 | 作用 | 边界 |
-|------|------|------|
+| :--- | :--- | :--- |
 | `timeoutSeconds=180` | 限制单次资源损失 | 不改变模型行为 |
 | `maxTokens=8000` | 限制输出上限 | 不等于不再循环 |
 | 行为层检测 | 提供停止/切换信号 | 需要上层执行恢复动作 |
@@ -141,12 +161,12 @@ mimo-stable/
 ├── pyproject.toml
 ├── CHANGELOG.md
 ├── scripts/
-│   ├── detect_loop.py           # 循环检测脚本
-│   ├── benchmark_fixtures.py    # 可复现 fixture 基准测试
-│   └── recovery_policy.py       # 保守恢复决策层（不执行副作用）
-├── tests/test_detector.py       # 行为契约测试
-├── fixtures/                    # 规范化回归样例
-├── logs/                        # 历史观察日志
+│   ├── detect_loop.py        # 循环检测脚本
+│   ├── benchmark_fixtures.py # 可复现 fixture 基准测试
+│   └── recovery_policy.py    # 保守恢复决策层（不执行副作用）
+├── tests/test_detector.py    # 行为契约测试
+├── fixtures/                 # 规范化回归样例
+├── logs/                     # 历史观察日志
 └── references/parameters.md
 ```
 
