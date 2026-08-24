@@ -40,7 +40,7 @@
 > 检测器和恢复层都不执行重试、模型切换或工具调用。
 
 ```bash
-python3 scripts/detect_loop.py --log fixtures/loop_detected.log
+python3 scripts/detect_loop.py --timeout 60 --log fixtures/loop_detected.log
 python3 tests/test_detector.py
 python3 scripts/benchmark_fixtures.py
 ```
@@ -237,7 +237,7 @@ bash scripts/test_long.sh
 ```bash
 git clone https://github.com/xli498/mimo-stable.git
 cd mimo-stable
-python3 scripts/detect_loop.py --log fixtures/loop_detected.log
+python3 scripts/detect_loop.py --timeout 60 --log fixtures/loop_detected.log
 ```
 
 ### 方式二：从 PyPI 安装 CLI
