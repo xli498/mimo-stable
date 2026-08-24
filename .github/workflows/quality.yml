@@ -31,12 +31,12 @@ jobs:
           python -m py_compile scripts/*.py
           python scripts/check_version.py
           bash -n scripts/*.sh
-          python3 tests/test_detector.py
+          python -m pip install ".[test]"
+          python -m pytest -q
           python3 scripts/benchmark_fixtures.py
       - name: Verify installed CLI
         shell: bash
         run: |
-          python -m pip install --no-deps .
           python - <<'PY'
           import mimo_stable
           assert mimo_stable.__version__ == "1.1.4"

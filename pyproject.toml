@@ -24,6 +24,9 @@ license = {file = "LICENSE"}
 authors = [{name = "xli498"}]
 dependencies = []
 
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
 [project.urls]
 Homepage = "https://github.com/xli498/mimo-stable"
 Repository = "https://github.com/xli498/mimo-stable"
