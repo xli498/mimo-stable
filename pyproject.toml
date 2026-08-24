@@ -31,10 +31,10 @@ Changelog = "https://github.com/xli498/mimo-stable/blob/main/CHANGELOG.md"
 Issues = "https://github.com/xli498/mimo-stable/issues"
 
 [project.scripts]
-mimo-loop-detect = "scripts.detect_loop:main"
+mimo-loop-detect = "mimo_stable.detect_loop:main"
 
 [tool.setuptools]
 py-modules = []
 
 [tool.setuptools.packages.find]
-include = ["scripts*"]
+include = ["mimo_stable*"]

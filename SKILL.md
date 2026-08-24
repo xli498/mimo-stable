@@ -1,15 +1,14 @@
-# SKILL.md — LLM Degenerate Loop Guardrails
-
-## 技能定义
-
-```yaml
+---
 name: mimo-stable
-description: >
-  跨模型 LLM 退化循环经验记录、检测与工程侧止损。最初来自 MiMo 案例，
-  不承诺根治模型问题，支持文本重复、工具调用重复和显式语言漂移检测。
-version: 1.1.0
+description: 跨模型 LLM 退化循环经验记录、检测与工程侧止损；不承诺根治模型问题。
+triggers: ["检测 LLM 循环", "分析重复输出", "工具调用重复"]
+dependencies: []
+version: 1.1.4
 author: xli498
-```
+created: 2026-08-24
+---
+
+# LLM Degenerate Loop Guardrails
 
 ## 运行器配置参考
 
