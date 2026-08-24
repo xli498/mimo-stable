@@ -23,6 +23,7 @@
 - [可复现证据](#可复现证据)
 - [如何记录和分享新案例](#如何记录和分享新案例)
 - [工程侧缓解措施](#工程侧缓解措施不是模型修复)
+- [示例](#示例)
 - [文件结构](#文件结构)
 - [测试](#测试)
 - [安装与集成](#安装与集成)
@@ -179,6 +180,15 @@ python3 scripts/detect_loop.py --text-mode instant --log fixtures/repeated_but_s
 | `maxTokens=8000` | 限制输出上限 | 不等于不再循环 |
 | 行为层检测 | 提供停止/切换信号 | 需要上层执行恢复动作 |
 
+## 示例
+
+- [基础文本检测](examples/basic-text-detection.md)
+- [工具调用检测](examples/tool-call-detection.md)
+- [恢复决策接入](examples/recovery-policy-integration.md)
+
+每个示例都只展示输入、检测信号或决策输出；实际停止、重试、切换模型和人工复核
+仍由上层运行器负责。
+
 ## 文件结构
 
 ```
@@ -192,6 +202,7 @@ mimo-stable/
 │   ├── benchmark_fixtures.py # 可复现 fixture 基准测试
 │   └── recovery_policy.py    # 保守恢复决策层（不执行副作用）
 ├── tests/test_detector.py    # 行为契约测试
+├── examples/                 # 最小集成示例
 ├── fixtures/                 # 规范化回归样例
 ├── logs/                     # 历史观察日志
 └── references/parameters.md
