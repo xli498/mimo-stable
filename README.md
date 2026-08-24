@@ -1,5 +1,7 @@
 # LLM Degenerate Loop Guardrails
 
+[English README](README.en.md)
+
 [![Quality Gate](https://github.com/xli498/mimo-stable/actions/workflows/quality.yml/badge.svg)](https://github.com/xli498/mimo-stable/actions/workflows/quality.yml)
 [![Release](https://img.shields.io/github/v/release/xli498/mimo-stable)](https://github.com/xli498/mimo-stable/releases)
 [![License](https://img.shields.io/github/license/xli498/mimo-stable)](LICENSE)
