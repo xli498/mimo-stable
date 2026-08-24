@@ -50,6 +50,7 @@ All notable changes to LLM Degenerate Loop Guardrails.
 +
 +### Added
 +- 安装后 CLI smoke test、包版本与 CHANGELOG 一致性检查，以及对应 CI 校验。
++- 清理重复的 Bug 模板，并收紧 Skill 中的历史配置与调度示例边界。
 +
 +### Planned
 - 收集脱敏的跨模型案例，并按模型/端点/参数分组比较
