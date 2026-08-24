@@ -2,6 +2,13 @@
 
 All notable changes to LLM Degenerate Loop Guardrails.
 
+## [1.1.3] - 2026-08-24
+
+### Fixed
+- Removed stray diff prefixes from the Unreleased changelog entries.
+- Added PyPI project links, keywords, and Python package classifiers.
+- Switched PyPI package metadata to the English README for a clearer public project page.
+
 ## [1.1.2] - 2026-08-24
 
 ### Fixed
@@ -61,14 +68,14 @@ All notable changes to LLM Degenerate Loop Guardrails.
 ## [Unreleased]
 
 ### Changed
-+- 明确源码本地安装边界，并将 MiMo 配置示例标注为历史案例而非通用推荐。
-+- 补充贡献、安全报告、Issue 和 PR 的隐私与证据边界要求。
-+
-+### Added
-+- 安装后 CLI smoke test、包版本与 CHANGELOG 一致性检查，以及对应 CI 校验。
-+- 清理重复的 Bug 模板，并收紧 Skill 中的历史配置与调度示例边界。
-+
-+### Planned
+- 明确源码本地安装边界，并将 MiMo 配置示例标注为历史案例而非通用推荐。
+- 补充贡献、安全报告、Issue 和 PR 的隐私与证据边界要求。
+
+### Added
+- 安装后 CLI smoke test、包版本与 CHANGELOG 一致性检查，以及对应 CI 校验。
+- 清理重复的 Bug 模板，并收紧 Skill 中的历史配置与调度示例边界。
+
+### Planned
 - 收集脱敏的跨模型案例，并按模型/端点/参数分组比较
 - 增加可选的真实运行日志适配器，但不保存密钥和敏感工具参数
 - 在有足够样本后再报告限定条件下的误报、漏报和检测延迟
