@@ -1,11 +1,7 @@
 ---
 name: mimo-stable
-description: 跨模型 LLM 退化循环经验记录、检测与工程侧止损；不承诺根治模型问题。
-triggers: ["检测 LLM 循环", "分析重复输出", "工具调用重复"]
-dependencies: []
+description: 跨模型 LLM 退化循环经验记录、检测与工程侧止损；当需要检测 LLM 循环、分析重复输出或工具调用重复时使用。不承诺根治模型问题。
 version: 1.1.4
-author: xli498
-created: 2026-08-24
 ---
 
 # LLM Degenerate Loop Guardrails
