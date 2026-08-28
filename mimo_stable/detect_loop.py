@@ -32,6 +32,7 @@ Exit codes:
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
 import time
@@ -62,6 +63,21 @@ class LoopDetector:
         json_output: bool = False,
         expected_language: str | None = None,
     ):
+        if not isinstance(repeat_threshold, int) or isinstance(repeat_threshold, bool) or repeat_threshold < 2:
+            raise ValueError("repeat_threshold must be at least 2")
+        if not isinstance(time_threshold, int) or isinstance(time_threshold, bool) or time_threshold < 0:
+            raise ValueError("time_threshold must be non-negative")
+        if (
+            not isinstance(similarity_threshold, (int, float))
+            or isinstance(similarity_threshold, bool)
+            or not math.isfinite(similarity_threshold)
+            or not 0.0 <= similarity_threshold <= 1.0
+        ):
+            raise ValueError("similarity_threshold must be between 0 and 1")
+        if text_mode not in {"duration", "instant"}:
+            raise ValueError("text_mode must be 'duration' or 'instant'")
+        if expected_language not in {None, "zh"}:
+            raise ValueError("expected_language must be None or 'zh'")
         self.repeat_threshold = repeat_threshold
         self.time_threshold = time_threshold
         self.similarity_threshold = similarity_threshold
@@ -86,6 +102,14 @@ class LoopDetector:
     def _params_hash(params: str) -> str:
         """Return a stable, non-reversible identifier for logging only."""
         return hashlib.sha256(params.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _block_evidence(text: str) -> dict[str, int | str]:
+        """Return non-reversible evidence without retaining output content."""
+        return {
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+            "text_length": len(text),
+        }
 
     @staticmethod
     def _looks_english(text: str) -> bool:
@@ -209,12 +233,12 @@ class LoopDetector:
                         "signal": "instant" if self.text_mode == "instant" else "duration_gated",
                         "repeats": len(recent),
                         "duration_seconds": duration,
-                        "sample": base[:200] + ("..." if len(base) > 200 else ""),
+                        "evidence": self._block_evidence(base),
                         "block_sizes": [len(b) for b in recent],
                     }
                     self._log(
                         "LOOP_DETECTED",
-                        f"{self.loop_reason}\n  Sample: {self.loop_details['sample']}",
+                        f"{self.loop_reason}\n  Text hash: {self.loop_details['evidence']['text_hash']}",
                     )
 
         # --- Rule 2: Same tool called 3+ times with identical params ---
@@ -454,7 +478,9 @@ Examples:
             if details.get("type") == "consecutive_identical_output":
                 print(f"  Repeats:          {details.get('repeats')}")
                 print(f"  Duration:         {details.get('duration_seconds', 0):.0f}s")
-                print(f"  Sample:           {details.get('sample', 'N/A')}")
+                evidence = details.get("evidence", {})
+                print(f"  Text hash:        {evidence.get('text_hash', 'N/A')}")
+                print(f"  Text length:      {evidence.get('text_length', 'N/A')}")
             elif details.get("type") == "identical_tool_calls":
                 print(f"  Tool:             {details.get('tool')}")
                 print(f"  Repeats:          {details.get('repeats')}")

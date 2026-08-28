@@ -2,6 +2,22 @@
 
 All notable changes to LLM Degenerate Loop Guardrails.
 
+## [1.1.5] - 2026-08-28
+
+### Added
+- Added framework-neutral `inspect_events`, explicit event normalization, and a
+  pure policy API for programmatic integration.
+- Added public API specification, roadmap, packaging checks, and regression
+  coverage for normalization, policy validation, and redacted evidence.
+
+### Fixed
+- Rejected boolean, fractional, non-finite, and malformed values at public API
+  boundaries instead of silently coercing them.
+- Reduced detector evidence to hashes and lengths so repeated text and tool
+  argument values do not enter output summaries.
+- Aligned documentation with actual consecutive tool-call and changed-parameter
+  behavior.
+
 ## [1.1.4] - 2026-08-24
 
 ### Fixed

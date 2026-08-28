@@ -213,6 +213,7 @@ mimo-stable/
 ## 测试
 
 ```bash
+python3 -m py_compile mimo_stable/*.py
 python3 -m py_compile scripts/*.py
 bash -n scripts/*.sh
 python3 tests/test_detector.py
@@ -248,7 +249,8 @@ mimo-loop-detect --json --timeout 60 --log fixtures/loop_detected.log
 ```
 
 > [!NOTE]
-> `mimo-stable` 提供命令行工具 `mimo-loop-detect`。当前不提供名为 `mimo_stable` 的 Python 导入 API。
+> `mimo-stable` 提供命令行工具 `mimo-loop-detect`，以及用于框架无关接入的
+> `inspect_events` Python API。
 
 上层运行器不应在检测到循环后盲目重试：
 

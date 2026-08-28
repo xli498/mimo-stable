@@ -7,9 +7,15 @@
 
 [中文说明](README.md)
 
+See the [public specification](docs/public-spec.md) and [implementation roadmap](docs/roadmap.md) for the supported contract and scope.
+
 A zero-runtime-dependency toolkit for detecting degenerate loops in LLM output
 and tool calls, producing conservative engineering decisions, and preserving
 reproducible evidence.
+
+The package also exposes a small `inspect_events` API for framework-neutral
+integration. It normalizes text and tool-call events, returns detector evidence
+and a policy suggestion, and performs no retries or other side effects.
 
 > [!IMPORTANT]
 > This project detects loop signals and emits recovery decisions. It does not
@@ -53,7 +59,7 @@ The detector is designed for observable signals such as:
 
 - consecutive identical or near-identical output blocks;
 - repeated tool calls, including normalized JSON key order;
-- suspicious non-consecutive tool-call patterns;
+- repeated calls only when their output blocks are consecutive;
 - language drift and related output anomalies when evidence supports them.
 
 Detection results are signals, not model-level explanations. MiMo is the initial
@@ -102,8 +108,8 @@ mimo-loop-detect --json --timeout 60 --log fixtures/loop_detected.log
 ```
 
 > [!NOTE]
-> `mimo-stable` provides the `mimo-loop-detect` command-line tool. It does not
-> currently provide a Python import API named `mimo_stable`.
+> `mimo-stable` provides the `mimo-loop-detect` command-line tool and the
+> framework-neutral `inspect_events` Python API.
 
 ## Examples
 

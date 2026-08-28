@@ -11,37 +11,11 @@ import json
 import sys
 from typing import Any
 
+ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-def decide(summary: dict[str, Any], *, retryable: bool = False, retry_count: int = 0) -> dict[str, Any]:
-    raw_detected = summary.get("loop_detected", False)
-    if not isinstance(raw_detected, bool):
-        raise ValueError("loop_detected must be a JSON boolean")
-    detected = raw_detected
-    details = summary.get("details") or {}
-    kind = details.get("type")
-
-    if not detected:
-        action = "continue"
-        rationale = "No degenerate-loop signal was detected."
-    elif kind == "repeated_side_effect_tool_call":
-        action = "pause_and_review"
-        rationale = "A repeated side-effecting call requires an idempotency and outcome check before retry."
-    elif retryable and retry_count == 0:
-        action = "stop_and_retry_once"
-        rationale = "Stop the current generation, then allow one controlled retry with a fresh context or strategy."
-    else:
-        action = "stop_and_escalate"
-        rationale = "Stop the current generation; do not blindly retry after a loop or exhausted retry budget."
-
-    return {
-        "action": action,
-        "rationale": rationale,
-        "detector_reason": summary.get("reason", ""),
-        "detector_type": kind,
-        "retryable": retryable,
-        "retry_count": retry_count,
-    }
-
+from mimo_stable.policy import decide
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a conservative recovery decision from detector JSON.")

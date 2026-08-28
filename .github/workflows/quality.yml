@@ -29,6 +29,7 @@ jobs:
         shell: bash
         run: |
           python -m py_compile scripts/*.py
+          python -m py_compile mimo_stable/*.py
           python scripts/check_version.py
           bash -n scripts/*.sh
           python -m pip install ".[test]"
@@ -38,8 +39,11 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
+          import tomllib
           import mimo_stable
-          assert mimo_stable.__version__ == "1.1.4"
+          with open("pyproject.toml", "rb") as handle:
+              expected = tomllib.load(handle)["project"]["version"]
+          assert mimo_stable.__version__ == expected
           PY
           set +e
           mimo-loop-detect --json --timeout 60 --log fixtures/loop_detected.log > result.json
