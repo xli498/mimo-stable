@@ -39,7 +39,10 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import tomllib
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
           import mimo_stable
           with open("pyproject.toml", "rb") as handle:
               expected = tomllib.load(handle)["project"]["version"]
