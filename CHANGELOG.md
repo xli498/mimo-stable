@@ -91,8 +91,13 @@ All notable changes to LLM Degenerate Loop Guardrails.
 ### Changed
 - 明确源码本地安装边界，并将 MiMo 配置示例标注为历史案例而非通用推荐。
 - 补充贡献、安全报告、Issue 和 PR 的隐私与证据边界要求。
-- SKILL.md frontmatter 对齐 OpenClaw 官方规范，触发语合并到 description。
-- CI 质量门禁的 Python 矩阵扩展到 3.13 和 3.14，pyproject.toml classifiers 同步补充。
+- SKILL.md frontmatter 对齐 OpenClaw 官方规范：移除非标准字段（triggers/dependencies/author/created），触发语并入 description。
+- CI 质量门禁的 Python 矩阵扩展到 3.13 和 3.14（此前仅 3.10–3.12，与宣称的 3.10+ 支持不一致）；pyproject.toml classifiers 同步补充 3.13/3.14。
+- 英文 README 的 CI 矩阵描述同步为 3.10–3.14；PyPI 安装示例改为自包含的 stdin 演示（pip 安装不含 fixtures/ 样例日志）并加注说明。
+
+### Fixed
+- `tests/test_detector.py` 补回 `if __name__ == "__main__"` 直跑入口；此前直接运行会静默跳过全部行为测试（exit 0 且零输出）。
+- `--log` 指向目录或不可读文件时不再抛裸 traceback；统一打印错误信息并以退出码 2 结束，与"检测到循环"的退出码 1 区分。
 
 ### Added
 - 安装后 CLI smoke test、包版本与 CHANGELOG 一致性检查，以及对应 CI 校验。

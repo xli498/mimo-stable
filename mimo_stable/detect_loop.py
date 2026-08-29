@@ -314,8 +314,15 @@ def read_from_file(filepath: str) -> list[tuple[str, float]]:
     if not path.exists():
         print(f"Error: File not found: {filepath}", file=sys.stderr)
         sys.exit(2)
+    if not path.is_file():
+        print(f"Error: Not a regular file: {filepath}", file=sys.stderr)
+        sys.exit(2)
 
-    content = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"Error: Cannot read {filepath}: {exc}", file=sys.stderr)
+        sys.exit(2)
     blocks = []
     current_block: list[str] = []
     current_time = time.time()

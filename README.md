@@ -245,12 +245,13 @@ python3 scripts/detect_loop.py --timeout 60 --log fixtures/loop_detected.log
 
 ```bash
 python3 -m pip install mimo-stable
-mimo-loop-detect --json --timeout 60 --log fixtures/loop_detected.log
+printf 'same block\n\nsame block\n\nsame block\n\n' | mimo-loop-detect --json --text-mode instant
 ```
 
 > [!NOTE]
 > `mimo-stable` 提供命令行工具 `mimo-loop-detect`，以及用于框架无关接入的
 > `inspect_events` Python API。
+> pip 安装不包含仓库的 `fixtures/` 样例日志；如需复现样例检测结果，请先用方式一克隆仓库。
 
 上层运行器不应在检测到循环后盲目重试：
 

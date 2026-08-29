@@ -104,12 +104,14 @@ python3 scripts/detect_loop.py --log fixtures/loop_detected.log
 
 ```bash
 python3 -m pip install mimo-stable
-mimo-loop-detect --json --timeout 60 --log fixtures/loop_detected.log
+printf 'same block\n\nsame block\n\nsame block\n\n' | mimo-loop-detect --json --text-mode instant
 ```
 
 > [!NOTE]
 > `mimo-stable` provides the `mimo-loop-detect` command-line tool and the
-> framework-neutral `inspect_events` Python API.
+> framework-neutral `inspect_events` Python API. The pip install does not ship
+> the repository's `fixtures/` sample logs; clone the repository first if you
+> want to reproduce those sample results.
 
 ## Examples
 
@@ -142,7 +144,7 @@ bash scripts/test_short.sh
 bash scripts/test_long.sh
 ```
 
-CI tests Python 3.10, 3.11, and 3.12.
+CI tests Python 3.10 through 3.14.
 
 ## Evidence and boundaries
 

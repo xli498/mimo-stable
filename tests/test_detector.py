@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Behavior contract tests for the dependency-free loop detector.
 
-The module runs directly with the standard library and is pytest-collectable
-when pytest is installed.
+Run directly with the standard library (``python3 tests/test_detector.py``)
+or via pytest when it is installed.
 """
 from __future__ import annotations
 import json
