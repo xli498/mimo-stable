@@ -17,6 +17,7 @@ def inspect_events(
     similarity_threshold: float = 0.95,
     text_mode: str = "duration",
     expected_language: str | None = None,
+    max_tool_calls: int | None = None,
     retryable: bool = False,
     retry_count: int = 0,
 ) -> dict[str, Any]:
@@ -29,12 +30,19 @@ def inspect_events(
         raise ValueError("retryable must be a boolean")
     if not isinstance(similarity_threshold, (int, float)) or isinstance(similarity_threshold, bool) or not math.isfinite(similarity_threshold):
         raise ValueError("similarity_threshold must be between 0 and 1")
+    if max_tool_calls is not None and (
+        not isinstance(max_tool_calls, int)
+        or isinstance(max_tool_calls, bool)
+        or max_tool_calls < 1
+    ):
+        raise ValueError("max_tool_calls must be None or a positive integer")
     detector = LoopDetector(
         repeat_threshold=repeat_threshold,
         time_threshold=time_threshold,
         similarity_threshold=similarity_threshold,
         text_mode=text_mode,
         expected_language=expected_language,
+        max_tool_calls=max_tool_calls,
         json_output=True,
     )
     for raw in events:

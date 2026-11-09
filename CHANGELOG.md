@@ -2,6 +2,21 @@
 
 All notable changes to LLM Degenerate Loop Guardrails.
 
+## [1.2.0] - 2026-11-09
+
+### Added
+- Added tool-call cycle detection: a 2–4 step tool-call pattern repeating twice
+  is a loop signal (`tool_call_cycle`); read/write mixes are exempt as
+  productive repair work.
+- Added within-block n-gram repetition detection: a 5-word phrase occurring
+  5+ times and covering half of a block of 50+ words is a loop signal
+  (`repeated_ngram_within_block`).
+- Added an opt-in tool-call budget ceiling (`--max-tool-calls`,
+  `inspect_events(..., max_tool_calls=N)`); off by default.
+- Tool-call identity now ignores volatile metadata keys (`request_id`,
+  `trace_id`, `created_at`, `timestamp`, `nonce`), so a loop cannot hide
+  behind regenerated request ids.
+
 ## [1.1.5] - 2026-08-28
 
 ### Added

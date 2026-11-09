@@ -35,9 +35,13 @@ intent or of a permanent provider failure.
 ## Detection classes
 
 The current implementation may identify identical or highly similar repeated
-output, canonicalized identical consecutive tool calls, repeated side-effect
-calls that require review, and configured language drift. A changed-parameter
-retry is treated as progress rather than a loop signal.
+output, canonicalized identical consecutive tool calls (ignoring volatile
+metadata keys such as request_id), repeated tool-call cycles, repeated
+n-grams inside a single long block, repeated side-effect calls that require
+review, and configured language drift. A changed-parameter retry that does
+not revisit earlier states is treated as progress rather than a loop signal;
+a repeating cycle of states is a loop signal. An opt-in tool-call budget
+ceiling is available and off by default.
 
 Thresholds are policy inputs. Defaults are conservative historical starting
 points and require calibration against the target runner.

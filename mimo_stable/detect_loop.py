@@ -8,7 +8,11 @@ repeatedly emits identical or near-identical text blocks.
 Detection rules:
   1. Consecutive identical output blocks (3+ repeats)
   2. Same tool called 3+ times with identical parameters
+     (volatile keys such as request_id are ignored)
   3. Output duration exceeding threshold without meaningful change
+  4. Tool-call cycles (a 2-4 step pattern repeating twice)
+  5. Repeated n-grams inside a single long block
+  6. Optional tool-call budget ceiling (opt-in only)
 
 Usage:
   # From stdin (pipe model output):
@@ -50,6 +54,60 @@ SIDE_EFFECT_TOOLS = {
     "purchase", "post", "publish", "create", "submit",
 }
 
+# Keys that carry per-attempt metadata rather than the intent of a call.
+# Two calls that differ only in these keys are the same call. Stripping them
+# keeps a loop from hiding behind regenerated request ids or timestamps.
+# Deliberately narrow: keys such as "id", "offset" or "path" stay, because
+# they can change what the call does.
+VOLATILE_PARAM_KEYS = {
+    "request_id", "trace_id", "created_at", "timestamp", "nonce",
+}
+
+# A repeating read/write pattern (read -> edit -> read -> edit) is normal
+# repair work, not a loop. A cycle is only a signal when it does not mix
+# both sides. The sets are intentionally small; unknown tools count as
+# neither, so an unknown-tool cycle still triggers.
+READ_TOOLS = {
+    "read", "browser", "web_fetch", "grep", "find", "search",
+    "list", "cat", "glob", "view",
+}
+WRITE_TOOLS = {
+    "write", "edit", "create", "delete", "remove", "send", "post",
+    "publish", "submit", "exec", "apply_patch", "move", "rename",
+    "update", "insert",
+}
+
+# Cycle detection: pattern lengths to look for, and how many complete
+# repetitions of the pattern count as a loop. Two full cycles matches the
+# published behavior of comparable guards without waiting for a long stall.
+CYCLE_PERIODS = (2, 3, 4)
+CYCLE_REPEATS = 2
+
+# Within-block n-gram repetition: a single long block whose own phrases
+# repeat. Both bars must clear, so boilerplate in a long answer does not
+# trigger on a few repeated lines.
+NGRAM_WORDS = 5
+NGRAM_MIN_WORDS = 50
+NGRAM_MIN_OCCURRENCES = 5
+NGRAM_MIN_COVERAGE = 0.5
+
+
+def strip_volatile_params(params):
+    """Return a copy of tool parameters without volatile metadata keys.
+
+    Applied recursively to nested objects. Lists are preserved as-is apart
+    from stripping inside any dict elements.
+    """
+    if isinstance(params, dict):
+        return {
+            key: strip_volatile_params(value)
+            for key, value in params.items()
+            if key not in VOLATILE_PARAM_KEYS
+        }
+    if isinstance(params, list):
+        return [strip_volatile_params(item) for item in params]
+    return params
+
 
 class LoopDetector:
     """Detects degenerate loops in model output streams."""
@@ -62,6 +120,7 @@ class LoopDetector:
         text_mode: str = "duration",
         json_output: bool = False,
         expected_language: str | None = None,
+        max_tool_calls: int | None = None,
     ):
         if not isinstance(repeat_threshold, int) or isinstance(repeat_threshold, bool) or repeat_threshold < 2:
             raise ValueError("repeat_threshold must be at least 2")
@@ -78,18 +137,30 @@ class LoopDetector:
             raise ValueError("text_mode must be 'duration' or 'instant'")
         if expected_language not in {None, "zh"}:
             raise ValueError("expected_language must be None or 'zh'")
+        if max_tool_calls is not None and (
+            not isinstance(max_tool_calls, int)
+            or isinstance(max_tool_calls, bool)
+            or max_tool_calls < 1
+        ):
+            raise ValueError("max_tool_calls must be None or a positive integer")
         self.repeat_threshold = repeat_threshold
         self.time_threshold = time_threshold
         self.similarity_threshold = similarity_threshold
         self.text_mode = text_mode
         self.json_output = json_output
         self.expected_language = expected_language
+        self.max_tool_calls = max_tool_calls
 
         # State
         window_size = max(repeat_threshold + 5, 20)
         self.blocks: deque = deque(maxlen=window_size)
         self.tool_calls: deque = deque(maxlen=window_size)
         self.block_timestamps: deque = deque(maxlen=window_size)
+        # Cycle signatures accumulate across result blocks: a real agent loop
+        # is call -> result -> call -> result, so clearing on every plain
+        # block would make cycles unreachable. Bounded separately.
+        self.cycle_signatures: deque = deque(maxlen=24)
+        self.total_tool_calls = 0
         self.loop_detected = False
         self.loop_reason = ""
         self.loop_details: dict = {}
@@ -142,9 +213,10 @@ class LoopDetector:
                     and isinstance(candidate.get("name"), str)
                     and isinstance(candidate.get("parameters"), dict)
                 ):
+                    params = strip_volatile_params(candidate["parameters"])
                     calls.append({
                         "name": candidate["name"],
-                        "params": json.dumps(candidate["parameters"], sort_keys=True),
+                        "params": json.dumps(params, sort_keys=True),
                     })
 
         # Function-style calls must begin a line. This avoids treating normal
@@ -157,6 +229,79 @@ class LoopDetector:
                 calls.append({"name": tool, "params": args})
 
         return calls
+
+    def _check_tool_cycle(self):
+        """Detect a repeating tool-call cycle (A-B-A-B, up to 4-step patterns).
+
+        Looks at the most recent signatures only. Returns True when a
+        pattern of CYCLE_PERIODS length has repeated CYCLE_REPEATS times,
+        unless the pattern mixes read-class and write-class tools (normal
+        repair work). Only the tool names and a hash of the pattern are
+        reported; parameter values never enter the output.
+        """
+        signatures = list(self.cycle_signatures)
+        for period in CYCLE_PERIODS:
+            needed = period * CYCLE_REPEATS
+            if len(signatures) < needed:
+                continue
+            window = signatures[-needed:]
+            pattern = window[:period]
+            if window[period:] != pattern:
+                continue
+            tools = {name for name, _ in pattern}
+            if tools & READ_TOOLS and tools & WRITE_TOOLS:
+                continue
+            pattern_text = json.dumps(pattern, sort_keys=True)
+            self.loop_detected = True
+            self.loop_reason = (
+                f"Detected tool-call cycle: {period}-step pattern repeated "
+                f"{CYCLE_REPEATS} times"
+            )
+            self.loop_details = {
+                "type": "tool_call_cycle",
+                "period": period,
+                "repeats": CYCLE_REPEATS,
+                "tools": sorted(tools),
+                "pattern_hash": hashlib.sha256(pattern_text.encode("utf-8")).hexdigest()[:16],
+            }
+            self._log("LOOP_DETECTED", self.loop_reason)
+            return True
+        return False
+
+    def _repeated_ngram_evidence(self, text: str) -> dict | None:
+        """Detect repetition inside one long block.
+
+        A 5-word shingle must occur at least 5 times and repeated material
+        must cover at least half of the block. Short blocks are skipped:
+        below 50 words there is not enough material to judge.
+        """
+        words = text.split()
+        if len(words) < NGRAM_MIN_WORDS:
+            return None
+        lowered = [word.casefold() for word in words]
+        starts: dict[tuple[str, ...], list[int]] = {}
+        for index in range(len(lowered) - NGRAM_WORDS + 1):
+            key = tuple(lowered[index:index + NGRAM_WORDS])
+            starts.setdefault(key, []).append(index)
+        max_occurrences = max(len(positions) for positions in starts.values())
+        if max_occurrences < NGRAM_MIN_OCCURRENCES:
+            return None
+        covered: set[int] = set()
+        for positions in starts.values():
+            if len(positions) >= 2:
+                for start in positions:
+                    covered.update(range(start, start + NGRAM_WORDS))
+        coverage = len(covered) / len(words)
+        if coverage < NGRAM_MIN_COVERAGE:
+            return None
+        return {
+            "type": "repeated_ngram_within_block",
+            "ngram_words": NGRAM_WORDS,
+            "occurrences": max_occurrences,
+            "block_words": len(words),
+            "coverage": round(coverage, 3),
+            "evidence": self._block_evidence(text),
+        }
 
     def _log(self, level: str, message: str):
         """Output a log message."""
@@ -192,6 +337,10 @@ class LoopDetector:
             self.tool_calls.clear()
         for t in tools:
             self.tool_calls.append(t)
+            # Cycle signatures accumulate across result blocks; the
+            # consecutive-call deque above is cleared by plain blocks.
+            self.cycle_signatures.append((t["name"], t["params"]))
+        self.total_tool_calls += len(tools)
 
         # A configured Chinese task that repeatedly produces English-only
         # output is an actionable drift signal. It is opt-in because language
@@ -282,11 +431,47 @@ class LoopDetector:
                 }
                 self._log("LOOP_DETECTED", self.loop_reason)
 
+        # --- Rule 3: Tool-call cycle (A-B-A-B) ---
+        if not self.loop_detected:
+            self._check_tool_cycle()
+
+        # --- Rule 4: Repeated n-grams inside one long block ---
+        if not self.loop_detected:
+            ngram = self._repeated_ngram_evidence(text)
+            if ngram is not None:
+                self.loop_detected = True
+                self.loop_reason = (
+                    f"Detected repeated {ngram['ngram_words']}-word phrase "
+                    f"{ngram['occurrences']} times inside one block"
+                )
+                self.loop_details = ngram
+                self._log("LOOP_DETECTED", self.loop_reason)
+
+        # --- Rule 5 (opt-in): Tool-call budget ceiling ---
+        if (
+            not self.loop_detected
+            and self.max_tool_calls is not None
+            and self.total_tool_calls > self.max_tool_calls
+        ):
+            self.loop_detected = True
+            self.loop_reason = (
+                f"Tool-call budget exceeded: {self.total_tool_calls} calls "
+                f"(limit {self.max_tool_calls})"
+            )
+            self.loop_details = {
+                "type": "tool_call_budget_exceeded",
+                "total_tool_calls": self.total_tool_calls,
+                "max_tool_calls": self.max_tool_calls,
+            }
+            self._log("LOOP_DETECTED", self.loop_reason)
+
     def reset(self):
         """Reset detector state."""
         self.blocks.clear()
         self.tool_calls.clear()
         self.block_timestamps.clear()
+        self.cycle_signatures.clear()
+        self.total_tool_calls = 0
         self.loop_detected = False
         self.loop_reason = ""
         self.loop_details = {}
@@ -299,6 +484,7 @@ class LoopDetector:
             "details": self.loop_details,
             "blocks_processed": len(self.blocks),
             "tool_calls_tracked": len(self.tool_calls),
+            "total_tool_calls": self.total_tool_calls,
         }
 
 
@@ -424,6 +610,15 @@ Examples:
         choices=["zh"],
         help="Enable language-drift detection for an explicitly Chinese task",
     )
+    parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=None,
+        help=(
+            "Optional last-resort ceiling: flag once the total number of "
+            "tool calls exceeds N (default: no ceiling)"
+        ),
+    )
     args = parser.parse_args()
 
     if args.threshold < 2:
@@ -432,6 +627,8 @@ Examples:
         parser.error("--timeout must be non-negative")
     if not 0.0 <= args.similarity <= 1.0:
         parser.error("--similarity must be between 0 and 1")
+    if args.max_tool_calls is not None and args.max_tool_calls < 1:
+        parser.error("--max-tool-calls must be a positive integer")
 
     # Create detector
     detector = LoopDetector(
@@ -441,6 +638,7 @@ Examples:
         text_mode=args.text_mode,
         json_output=args.json,
         expected_language=args.expect_language,
+        max_tool_calls=args.max_tool_calls,
     )
 
     # Read input

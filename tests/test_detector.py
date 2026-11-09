@@ -73,6 +73,10 @@ def test_runtime_facade_contract():
         {"text_mode": "unknown"},
         {"expected_language": "en"},
         {"retry_count": True},
+        {"max_tool_calls": True},
+        {"max_tool_calls": 0},
+        {"max_tool_calls": -1},
+        {"max_tool_calls": 1.5},
     ):
         try:
             inspect_events([], **kwargs)
@@ -98,13 +102,62 @@ def test_runtime_facade_contract():
         pass
     else:
         raise AssertionError("non-list event collection accepted")
-    for kwargs in ({"repeat_threshold": True}, {"time_threshold": 0.5}, {"similarity_threshold": float("nan")}, {"text_mode": "unknown"}):
+    for kwargs in ({"repeat_threshold": True}, {"time_threshold": 0.5}, {"similarity_threshold": float("nan")}, {"text_mode": "unknown"}, {"max_tool_calls": True}, {"max_tool_calls": 0}, {"max_tool_calls": 1.5}):
         try:
             LoopDetector(**kwargs)
         except ValueError:
             pass
         else:
             raise AssertionError(f"detector accepted invalid configuration: {kwargs!r}")
+
+
+def test_new_signals_contract():
+    def tool(name, arguments):
+        return {"type": "tool_call", "name": name, "arguments": arguments}
+
+    # A 2-step tool-call cycle needs two full repetitions: three calls are not enough.
+    partial = inspect_events(
+        [tool("exec", {"cmd": "ls"}), tool("exec", {"cmd": "pwd"}), tool("exec", {"cmd": "ls"})],
+        text_mode="instant",
+    )
+    assert partial["loop_detected"] is False, partial
+    cycle = inspect_events(
+        [tool("exec", {"cmd": "ls"}), tool("exec", {"cmd": "pwd"}), tool("exec", {"cmd": "ls"}), tool("exec", {"cmd": "pwd"})],
+        text_mode="instant",
+    )
+    assert cycle["loop_detected"] is True, cycle
+    assert cycle["details"]["type"] == "tool_call_cycle", cycle
+    assert cycle["details"]["period"] == 2, cycle
+    # A read/write mix is productive repair work, not a loop.
+    productive = inspect_events(
+        [tool("read", {"path": "a.txt"}), tool("write", {"path": "b.txt", "text": "draft"}), tool("read", {"path": "a.txt"}), tool("write", {"path": "b.txt", "text": "draft"})],
+        text_mode="instant",
+    )
+    assert productive["loop_detected"] is False, productive
+    # Calls that differ only in volatile metadata are the same call.
+    volatile = inspect_events(
+        [tool("read", {"path": "a.txt", "request_id": f"req-{i}"}) for i in range(3)],
+        text_mode="instant",
+    )
+    assert volatile["loop_detected"] is True, volatile
+    assert volatile["details"]["type"] == "identical_tool_calls", volatile
+    # A long block that repeats its own phrases is degenerate on its own.
+    sentence = "The quarterly report shows steady growth across all regions today."
+    long_block = " ".join([sentence] * 6)
+    ngram = inspect_events([long_block], text_mode="instant")
+    assert ngram["loop_detected"] is True, ngram
+    assert ngram["details"]["type"] == "repeated_ngram_within_block", ngram
+    assert ngram["details"]["occurrences"] >= 5, ngram
+    short_block = " ".join([sentence] * 3)
+    assert inspect_events([short_block], text_mode="instant")["loop_detected"] is False
+    # The tool-call budget ceiling is opt-in and counts every call.
+    many = [tool("read", {"path": f"file{i}.txt"}) for i in range(12)]
+    assert inspect_events(many, text_mode="instant")["loop_detected"] is False
+    capped = inspect_events(many, text_mode="instant", max_tool_calls=10)
+    assert capped["loop_detected"] is True, capped
+    assert capped["details"]["type"] == "tool_call_budget_exceeded", capped
+    assert capped["details"]["total_tool_calls"] == 11, capped
+    print("new signals tests passed")
 
 
 def test_detector_behavior_contract():
@@ -129,6 +182,13 @@ def test_detector_behavior_contract():
     run("tool_key_order_repeat.log",1,True, forbidden=("sensitive-demo",))
     run("side_effect_repeat.log",1,True, forbidden=("sensitive-demo",))
     run("language_drift_zh.log",1,True, extra_args=("--expect-language","zh"))
+    run("tool_cycle_abab.log",1,True)
+    run("tool_cycle_productive.log",0,False)
+    run("tool_volatile_key_repeat.log",1,True)
+    run("repeated_ngram_within_block.log",1,True)
+    run("ngram_below_threshold.log",0,False)
+    run("tool_budget_exceeded.log",1,True, extra_args=("--max-tool-calls","10"))
+    run("tool_budget_exceeded.log",0,False)
     leak = subprocess.run(
         [sys.executable, str(DETECTOR), "--json", "--text-mode", "instant"],
         input='{"name":"send","parameters":{"api_key":"sensitive-demo"}}\n\n' * 2,
@@ -165,7 +225,7 @@ def test_detector_behavior_contract():
     assert bad.returncode == 2 and 'error' in bad.stderr
     bad=subprocess.run([sys.executable,str(POLICY)],input=json.dumps({"loop_detected":"false"}),capture_output=True,text=True)
     assert bad.returncode == 2 and 'boolean' in bad.stderr
-    for flag in (("--threshold", "1"), ("--timeout", "-1"), ("--similarity", "1.1")):
+    for flag in (("--threshold", "1"), ("--timeout", "-1"), ("--similarity", "1.1"), ("--max-tool-calls", "0")):
         bad=subprocess.run([sys.executable,str(DETECTOR),*flag,"--log",str(ROOT/"fixtures"/"normal_output.log")],capture_output=True,text=True)
         assert bad.returncode == 2, (flag,bad.stdout,bad.stderr)
     empty=subprocess.run([sys.executable,str(DETECTOR),"--json"],input="",capture_output=True,text=True)
@@ -188,4 +248,5 @@ def test_detector_behavior_contract():
 if __name__ == "__main__":
     test_event_normalization_contract()
     test_runtime_facade_contract()
+    test_new_signals_contract()
     test_detector_behavior_contract()

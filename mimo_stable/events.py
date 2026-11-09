@@ -11,6 +11,8 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .detect_loop import strip_volatile_params
+
 
 @dataclass(frozen=True)
 class NormalizedEvent:
@@ -40,7 +42,10 @@ def _tool_text(name: Any, arguments: Any) -> str:
     else:
         raise ValueError("tool arguments must be a JSON string or object")
     try:
-        canonical = json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        canonical = json.dumps(
+            strip_volatile_params(params),
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError("tool arguments must be JSON-serializable") from exc
     fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
