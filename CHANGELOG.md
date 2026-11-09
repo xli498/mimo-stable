@@ -35,6 +35,10 @@ All notable changes to LLM Degenerate Loop Guardrails.
   ")" inside a quoted JSON string value (or an escaped quote just before
   one) no longer truncates the arguments or misreports distinct writes as
   a repeated side-effecting call; CLI and structured-API counts agree.
+- Zero-argument function-style calls (e.g. `browser()`) are now counted
+  with params normalized to `{}`, exactly as the structured API counts
+  `arguments: {}`; previously the CLI silently dropped them and could
+  miss a tool-call budget breach the API would report.
 - Corrected the English README: the "consecutive output blocks" rule applies
   to repeated identical calls, while tool-call cycles are tracked across
   plain result blocks.

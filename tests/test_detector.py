@@ -370,6 +370,114 @@ def test_must_m5_paren_in_string():
     print("Must M5 paren-in-string regression tests passed")
 
 
+def test_must_m5_empty_args():
+    """Empty-args Must (PR #3 re-review 2): a zero-argument function-style
+    call (``browser()``) must count exactly like the structured API counts
+    ``arguments: {}`` -- same total, same budget verdict -- on both
+    channels. Covers the headline repro (two empty calls, budget 1), the
+    single-call no-fire case, the budget boundary (total == limit does not
+    fire), mixed empty/parameterized counting, and the identical-call rule
+    for repeated empty calls. Fixture: fixtures/must_m5_empty_args.log.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_stdin(text, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", *extra_args],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    def tool(name, arguments):
+        return {"type": "tool_call", "name": name, "arguments": arguments}
+
+    def assert_agree(text, events, extra_args=(), api_kwargs=None):
+        rc, data = cli_stdin(text, extra_args)
+        api = inspect_events(events, **(api_kwargs or {}))
+        assert data["loop_detected"] == api["loop_detected"], (data, api)
+        assert data["total_tool_calls"] == api["total_tool_calls"], (data, api)
+        assert data.get("details", {}).get("type") == \
+            api.get("details", {}).get("type"), (data, api)
+        return rc, data, api
+
+    # Headline repro from the re-review: fixture (log file, --timeout 60
+    # like the other must_* fixtures) plus the exact stdin form.
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+         "--max-tool-calls", "1",
+         "--log", str(ROOT / "fixtures" / "must_m5_empty_args.log")],
+        capture_output=True, text=True)
+    assert p.returncode == 1, (p.returncode, p.stdout, p.stderr)
+    data = json.loads(p.stdout)
+    assert data["loop_detected"] is True, data
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["total_tool_calls"] == 2, data
+    rc, data, api = assert_agree(
+        "browser()\n\nbrowser()\n\n",
+        [tool("browser", {}), tool("browser", {})],
+        ("--max-tool-calls", "1"), {"max_tool_calls": 1})
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["total_tool_calls"] == 2, data
+
+    # Single empty call does not fire the budget; two calls at a limit of
+    # 2 sit exactly on the boundary and do not fire either.
+    rc, data, api = assert_agree(
+        "browser()\n\n", [tool("browser", {})],
+        ("--max-tool-calls", "1"), {"max_tool_calls": 1})
+    assert rc == 0 and data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 1, data
+    rc, data, api = assert_agree(
+        "browser()\n\nbrowser()\n\n",
+        [tool("browser", {}), tool("browser", {})],
+        ("--max-tool-calls", "2"), {"max_tool_calls": 2})
+    assert rc == 0 and data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 2, data
+
+    # Mixed empty and parameterized calls count together: one empty plus
+    # one parameterized call breaches a limit of 1, and stays under 2.
+    mixed_text = "browser()\n\nread({\"path\":\"a.txt\"})\n\n"
+    mixed_events = [tool("browser", {}), tool("read", {"path": "a.txt"})]
+    rc, data, api = assert_agree(
+        mixed_text, mixed_events,
+        ("--max-tool-calls", "1"), {"max_tool_calls": 1})
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["total_tool_calls"] == 2, data
+    rc, data, api = assert_agree(
+        mixed_text, mixed_events,
+        ("--max-tool-calls", "2"), {"max_tool_calls": 2})
+    assert rc == 0 and data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 2, data
+    rc, data, api = assert_agree(
+        "read({\"path\":\"a.txt\"})\n\nbrowser()\n\nbrowser()\n\n",
+        [tool("read", {"path": "a.txt"}),
+         tool("browser", {}), tool("browser", {})],
+        ("--max-tool-calls", "2"), {"max_tool_calls": 2})
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["total_tool_calls"] == 3, data
+
+    # Repeated empty calls follow the same identical-call rule as repeated
+    # parameterized calls (third identical call fires), on both channels.
+    rc, data, api = assert_agree(
+        "browser()\n\nbrowser()\n\nbrowser()\n\n",
+        [tool("browser", {}), tool("browser", {}), tool("browser", {})],
+        ("--max-tool-calls", "2"), {"max_tool_calls": 2})
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "identical_tool_calls", data
+    assert data["total_tool_calls"] == 3, data
+
+    # Extraction layer: browser() and browser({}) are the same signature.
+    detector = LoopDetector()
+    assert detector._extract_tool_calls("browser()") == [
+        {"name": "browser", "params": "{}"}]
+    assert detector._extract_tool_calls("browser()") == \
+        detector._extract_tool_calls("browser({})")
+    assert detector._extract_tool_calls("browser(  )") == [
+        {"name": "browser", "params": "{}"}]
+    print("Must M5 empty-args regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -461,4 +569,5 @@ if __name__ == "__main__":
     test_new_signals_contract()
     test_must_regressions_m1_to_m6()
     test_must_m5_paren_in_string()
+    test_must_m5_empty_args()
     test_detector_behavior_contract()

@@ -250,7 +250,10 @@ class LoopDetector:
         When a function-style argument parses as a JSON object it is
         normalized exactly like a JSON record (keys sorted, top-level
         volatile keys ignored); any other argument syntax is compared
-        verbatim (M5). The closing parenthesis is found by a quote-aware
+        verbatim (M5). A zero-argument call (``browser()``) counts with
+        params ``"{}"``, the same normalized form the structured API
+        produces for ``arguments: {}``, so CLI and API agree on the
+        tool-call budget. The closing parenthesis is found by a quote-aware
         scan, so a ")" inside a quoted string (or an escaped quote just
         before one) does not end the arguments early (M5 boundary); a call
         whose parentheses never balance is not counted at all, because an
@@ -310,6 +313,14 @@ class LoopDetector:
             args, end = scanned
             args = args.strip()
             if not args:
+                # Zero-argument call (e.g. ``browser()``): count it, with
+                # params normalized to "{}" exactly as the structured API
+                # normalizes ``arguments: {}``. Dropping it here made the
+                # CLI silently disagree with the API on the tool-call
+                # budget (empty-args Must, PR #3 re-review 2).
+                candidates.append((header.start(), end, {
+                    "name": tool, "params": "{}",
+                }))
                 continue
             params: str = args
             try:
