@@ -160,6 +160,116 @@ def test_new_signals_contract():
     print("new signals tests passed")
 
 
+def test_must_regressions_m1_to_m6():
+    """Regression tests for review Must items M1-M6 (PR #3 review 2026-11-09).
+
+    Each case pins the flipped behavior of the review's section-7
+    reproducers: inputs that used to misfire must no longer fire, and inputs
+    that used to be missed must now fire. Fixture files live in
+    fixtures/must_*.log; the API half mirrors the same inputs through
+    inspect_events so CLI and structured API agree.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_fixture(name, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+             *extra_args, "--log", str(ROOT / "fixtures" / name)],
+            capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    def cli_stdin(text, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--text-mode", "instant",
+             *extra_args],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    def tool(name, arguments):
+        return {"type": "tool_call", "name": name, "arguments": arguments}
+
+    # M1: only a timestamp nested inside the written payload differs.
+    rc, data = cli_fixture("must_m1_business_timestamp.log")
+    assert rc == 0 and data["loop_detected"] is False, data
+    writes = [tool("write", {"path": "audit.json", "content":
+              [{"timestamp": x, "value": 42}]}) for x in (100, 101)]
+    assert inspect_events(writes)["loop_detected"] is False
+    # ... while a top-level volatile key still does not hide a repeat.
+    volatile = inspect_events(
+        [tool("read", {"path": "a.txt", "request_id": f"req-{i}"})
+         for i in range(3)],
+        text_mode="instant")
+    assert volatile["loop_detected"] is True, volatile
+    assert volatile["details"]["type"] == "identical_tool_calls", volatile
+
+    # M2: the 5x phrase covers only 25 of 100 words; a 2x template must not
+    # top the coverage up to the 0.5 bar.
+    rc, data = cli_fixture("must_m2_ngram_mixed_coverage.log")
+    assert rc == 0 and data["loop_detected"] is False, data
+    phrase = "alpha bravo charlie delta echo"
+    head = " ".join(phrase + f" marker{i}" for i in range(5))
+    template = " ".join(f"field{i}" for i in range(20))
+    tail = " ".join(f"unique{i}" for i in range(30))
+    assert inspect_events(
+        [" ".join([head, template, template, tail])],
+        text_mode="instant")["loop_detected"] is False
+
+    # M3: a nested tool-shaped example is not a second call (CLI == API),
+    # and two function-style calls on two lines of one block count as two.
+    rc, data = cli_fixture("must_m3_nested_example.log",
+                           ("--max-tool-calls", "1"))
+    assert rc == 0 and data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 1, data
+    nested = tool("read", {"path": "config.json", "example":
+                  {"name": "send", "parameters": {"message": "example"}}})
+    api = inspect_events([nested], max_tool_calls=1)
+    assert api["loop_detected"] is False and api["total_tool_calls"] == 1, api
+    rc, data = cli_fixture("must_m3_multiline_calls.log",
+                           ("--max-tool-calls", "1"))
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["details"]["total_tool_calls"] == 2, data
+
+    # M4: A-B-A-B-C in one JSON-array block still reports the cycle.
+    rc, data = cli_fixture("must_m4_cycle_masked_by_trailing_call.log")
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "tool_call_cycle", data
+    assert data["details"]["period"] == 2, data
+    calls = [tool("exec", {"cmd": x}) for x in ("A", "B", "A", "B", "C")]
+    one_block = inspect_events([json.dumps([
+        {"name": e["name"], "parameters": e["arguments"]} for e in calls])])
+    assert one_block["loop_detected"] is True, one_block
+    assert one_block["details"]["type"] == "tool_call_cycle", one_block
+    assert one_block["details"]["period"] == 2, one_block
+
+    # M5: function-style reads differing only in request_id are identical,
+    # with the same params hash as the JSON-record form.
+    rc, data = cli_fixture("must_m5_function_volatile_keys.log")
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "identical_tool_calls", data
+    reads = [tool("read", {"path": "a.txt", "request_id": str(i)})
+             for i in range(3)]
+    func_text = "\n\n".join(
+        "read(" + json.dumps(e["arguments"]) + ")" for e in reads) + "\n\n"
+    json_text = "\n\n".join(
+        json.dumps({"name": e["name"], "parameters": e["arguments"]})
+        for e in reads) + "\n\n"
+    _, func_data = cli_stdin(func_text)
+    _, json_data = cli_stdin(json_text)
+    assert func_data["loop_detected"] is True, func_data
+    assert func_data["details"]["type"] == "identical_tool_calls", func_data
+    assert func_data["details"]["params_hash"] == \
+        json_data["details"]["params_hash"], (func_data, json_data)
+
+    # M6: a cycle across plain result blocks is still reported (this pins the
+    # documented behavior behind the corrected README wording).
+    rc, data = cli_fixture("must_m6_cycle_across_results.log")
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "tool_call_cycle", data
+    assert data["details"]["period"] == 2, data
+    print("Must M1-M6 regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -249,4 +359,5 @@ if __name__ == "__main__":
     test_event_normalization_contract()
     test_runtime_facade_contract()
     test_new_signals_contract()
+    test_must_regressions_m1_to_m6()
     test_detector_behavior_contract()

@@ -8,7 +8,8 @@ repeatedly emits identical or near-identical text blocks.
 Detection rules:
   1. Consecutive identical output blocks (3+ repeats)
   2. Same tool called 3+ times with identical parameters
-     (volatile keys such as request_id are ignored)
+     (top-level volatile keys such as request_id are ignored;
+      the same key nested inside a business payload is kept)
   3. Output duration exceeding threshold without meaningful change
   4. Tool-call cycles (a 2-4 step pattern repeating twice)
   5. Repeated n-grams inside a single long block
@@ -57,8 +58,13 @@ SIDE_EFFECT_TOOLS = {
 # Keys that carry per-attempt metadata rather than the intent of a call.
 # Two calls that differ only in these keys are the same call. Stripping them
 # keeps a loop from hiding behind regenerated request ids or timestamps.
-# Deliberately narrow: keys such as "id", "offset" or "path" stay, because
-# they can change what the call does.
+# Deliberately narrow in two ways: keys such as "id", "offset" or "path"
+# stay, because they can change what the call does; and stripping applies
+# only to the top level of the arguments object, because a field of the same
+# name nested inside a business payload (for example a "timestamp" inside a
+# list of records being written) is business content, not call metadata.
+# Callers that carry metadata in a nested object must hoist it to the top
+# level for it to be ignored.
 VOLATILE_PARAM_KEYS = {
     "request_id", "trace_id", "created_at", "timestamp", "nonce",
 }
@@ -93,19 +99,20 @@ NGRAM_MIN_COVERAGE = 0.5
 
 
 def strip_volatile_params(params):
-    """Return a copy of tool parameters without volatile metadata keys.
+    """Return a copy of tool parameters without top-level volatile keys.
 
-    Applied recursively to nested objects. Lists are preserved as-is apart
-    from stripping inside any dict elements.
+    Only the top level of the arguments object is denoised: that is where
+    per-attempt call metadata lives. Nested values are business payload and
+    are preserved verbatim, so two writes that differ only in a timestamp
+    inside the content being written stay different calls (M1). Non-dict
+    inputs are returned unchanged.
     """
     if isinstance(params, dict):
         return {
-            key: strip_volatile_params(value)
+            key: value
             for key, value in params.items()
             if key not in VOLATILE_PARAM_KEYS
         }
-    if isinstance(params, list):
-        return [strip_volatile_params(item) for item in params]
     return params
 
 
@@ -196,39 +203,88 @@ class LoopDetector:
         - JSON tool_call blocks
         - Function call patterns
         - Tool use markers
+
+        One JSON object is one call record: once an object is identified as
+        a tool call, scanning resumes after it, so a nested example inside
+        its parameters is never counted as a second call (M3). A JSON object
+        that is not itself a call record is still scanned inside, so a call
+        wrapped in another object is found. Function-style calls may start
+        on any line, so several calls in one block are all counted (M3).
+        When a function-style argument parses as a JSON object it is
+        normalized exactly like a JSON record (keys sorted, top-level
+        volatile keys ignored); any other argument syntax is compared
+        verbatim (M5). When a JSON record and a function-style call overlap
+        in the text, only the outer construct is kept, so the same call is
+        never counted twice.
         """
-        calls = []
+        candidates: list[tuple[int, int, dict]] = []
 
         # Parse JSON objects rather than matching braces. Tool parameters may
         # legitimately contain nested objects, arrays, or escaped strings.
         decoder = json.JSONDecoder()
-        for match in re.finditer(r'\{', text):
+        pos = 0
+        while True:
+            brace = re.search(r"\{", text[pos:])
+            if brace is None:
+                break
+            start = pos + brace.start()
             try:
-                candidate, _ = decoder.raw_decode(text[match.start():])
+                candidate, end = decoder.raw_decode(text[start:])
             except (json.JSONDecodeError, ValueError):
-                pass
-            else:
-                if (
-                    isinstance(candidate, dict)
-                    and isinstance(candidate.get("name"), str)
-                    and isinstance(candidate.get("parameters"), dict)
-                ):
-                    params = strip_volatile_params(candidate["parameters"])
-                    calls.append({
+                pos = start + 1
+                continue
+            if (
+                isinstance(candidate, dict)
+                and isinstance(candidate.get("name"), str)
+                and isinstance(candidate.get("parameters"), dict)
+            ):
+                params = strip_volatile_params(candidate["parameters"])
+                candidates.append((
+                    start,
+                    start + end,
+                    {
                         "name": candidate["name"],
                         "params": json.dumps(params, sort_keys=True),
-                    })
+                    },
+                ))
+                pos = start + end
+            else:
+                pos = start + 1
 
         # Function-style calls must begin a line. This avoids treating normal
         # prose such as "I will edit (the draft)" as an actual tool invocation.
-        func_pattern = r'^\s*(read|write|exec|edit|browser|web_fetch)\s*\(([^)]*)\)'
-        for match in re.finditer(func_pattern, text, re.IGNORECASE):
+        func_pattern = r"^\s*(read|write|exec|edit|browser|web_fetch)\s*\(([^)]*)\)"
+        for match in re.finditer(func_pattern, text, re.IGNORECASE | re.MULTILINE):
             tool = match.group(1).lower()
             args = match.group(2).strip()
-            if args:
-                calls.append({"name": tool, "params": args})
+            if not args:
+                continue
+            params: str = args
+            try:
+                parsed = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                params = json.dumps(
+                    strip_volatile_params(parsed), sort_keys=True
+                )
+            candidates.append((match.start(), match.end(), {
+                "name": tool, "params": params,
+            }))
 
-        return calls
+        # Keep candidates in text order, dropping any candidate strictly
+        # inside one that starts earlier (the outer construct wins).
+        candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+        kept: list[tuple[int, int, dict]] = []
+        for candidate in candidates:
+            if any(
+                candidate[0] < other[1] and other[0] < candidate[1]
+                for other in kept
+            ):
+                continue
+            kept.append(candidate)
+        kept.sort(key=lambda item: item[0])
+        return [call for _, _, call in kept]
 
     def _check_tool_cycle(self):
         """Detect a repeating tool-call cycle (A-B-A-B, up to 4-step patterns).
@@ -237,7 +293,9 @@ class LoopDetector:
         pattern of CYCLE_PERIODS length has repeated CYCLE_REPEATS times,
         unless the pattern mixes read-class and write-class tools (normal
         repair work). Only the tool names and a hash of the pattern are
-        reported; parameter values never enter the output.
+        reported; parameter values never enter the output. Callers check
+        after every call is appended (M4), so a cycle is caught the moment
+        it completes even if later calls in the same block follow it.
         """
         signatures = list(self.cycle_signatures)
         for period in CYCLE_PERIODS:
@@ -273,7 +331,11 @@ class LoopDetector:
 
         A 5-word shingle must occur at least 5 times and repeated material
         must cover at least half of the block. Short blocks are skipped:
-        below 50 words there is not enough material to judge.
+        below 50 words there is not enough material to judge. Occurrence
+        count and coverage are computed over the same set of phrases: only
+        phrases occurring at least 5 times contribute coverage (M2), so a
+        block cannot clear the coverage bar with phrases that merely
+        occurred twice.
         """
         words = text.split()
         if len(words) < NGRAM_MIN_WORDS:
@@ -288,7 +350,7 @@ class LoopDetector:
             return None
         covered: set[int] = set()
         for positions in starts.values():
-            if len(positions) >= 2:
+            if len(positions) >= NGRAM_MIN_OCCURRENCES:
                 for start in positions:
                     covered.update(range(start, start + NGRAM_WORDS))
         coverage = len(covered) / len(words)
@@ -340,6 +402,11 @@ class LoopDetector:
             # Cycle signatures accumulate across result blocks; the
             # consecutive-call deque above is cleared by plain blocks.
             self.cycle_signatures.append((t["name"], t["params"]))
+            # Check on every call, not only at the end of the block (M4):
+            # a cycle completes the moment its last call arrives, and later
+            # calls in the same block must not mask it.
+            if not self.loop_detected:
+                self._check_tool_cycle()
         self.total_tool_calls += len(tools)
 
         # A configured Chinese task that repeatedly produces English-only

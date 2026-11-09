@@ -36,9 +36,9 @@ runtime:
 
 ### 检测条件
 - 连续 3+ 次输出完全相同或高度相似的文本（相似度 ≥ 95%）
-- 连续 3+ 次工具调用参数完全相同（仅 request_id／trace_id 等易变键不同也算相同）
-- 工具调用出现 2–4 步的循环模式并完整重复 2 次（如 A-B-A-B；读→写混合的修复循环除外）
-- 单个长块（50+ 词）内同一 5 词短语出现 5+ 次且覆盖块内一半以上内容
+- 连续 3+ 次工具调用参数完全相同（仅顶层参数中的 request_id／trace_id 等易变键不同也算相同；嵌套在业务数据里的同名字段保留）
+- 工具调用出现 2–4 步的循环模式并完整重复 2 次（如 A-B-A-B；读→写混合的修复循环除外；每次调用进入时即判定，同一块内后续调用不会掩盖已形成的周期，普通结果块也不打断周期签名）
+- 单个长块（50+ 词）内出现 5+ 次的同一 5 词短语覆盖块内一半以上内容（次数与覆盖率按同一批短语计算）
 - 模型从中文输出切换为英文输出，且无视 System Prompt
 - 可选上限：工具调用总数超过 `--max-tool-calls` 设定值（默认关闭）
 
@@ -91,7 +91,7 @@ python3 -c "import json,sys; d=json.load(open('/tmp/loop-summary.json')); sys.ex
 ```
 输入: [exec("top"), exec("top"), exec("top")]
 阈值: 3 次
-参数匹配: 完全相同 (JSON keys 排序后比较；request_id／trace_id／created_at／timestamp／nonce 等易变键先剥离)
+参数匹配: 完全相同 (JSON keys 排序后比较；仅顶层参数中的 request_id／trace_id／created_at／timestamp／nonce 等易变键先剥离，嵌套业务数据不剥离；函数式调用的参数能解析为 JSON 对象时同样处理，其他参数语法按原文比较)
 输出: LOOP_DETECTED
 ```
 
@@ -99,7 +99,7 @@ python3 -c "import json,sys; d=json.load(open('/tmp/loop-summary.json')); sys.ex
 
 ```
 输入: [exec("ls"), exec("pwd"), exec("ls"), exec("pwd")]
-判定: 2–4 步的调用模式完整重复 2 次
+判定: 2–4 步的调用模式完整重复 2 次；每次调用进入时即判定，同一块内后续调用不会掩盖已形成的周期；普通结果块不打断周期签名
 豁免: 模式内同时含读类与写类工具时不触发（读→写→读→写是正常修复循环）
 输出: LOOP_DETECTED (tool_call_cycle)
 ```
@@ -108,7 +108,7 @@ python3 -c "import json,sys; d=json.load(open('/tmp/loop-summary.json')); sys.ex
 
 ```
 输入: 单个 50+ 词的块，其中同一 5 词短语出现 5+ 次
-判定: 出现次数 ≥ 5 且重复内容覆盖块内一半以上词数
+判定: 出现次数 ≥ 5 的短语覆盖块内一半以上词数（次数与覆盖率按同一批短语计算；仅出现 2 次的短语不计入覆盖率）
 输出: LOOP_DETECTED (repeated_ngram_within_block)
 ```
 

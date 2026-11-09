@@ -35,12 +35,16 @@ intent or of a permanent provider failure.
 ## Detection classes
 
 The current implementation may identify identical or highly similar repeated
-output, canonicalized identical consecutive tool calls (ignoring volatile
-metadata keys such as request_id), repeated tool-call cycles, repeated
+output, canonicalized identical consecutive tool calls (ignoring top-level
+volatile metadata keys such as request_id; the same key nested inside a
+business payload is kept), repeated tool-call cycles, repeated
 n-grams inside a single long block, repeated side-effect calls that require
 review, and configured language drift. A changed-parameter retry that does
 not revisit earlier states is treated as progress rather than a loop signal;
-a repeating cycle of states is a loop signal. An opt-in tool-call budget
+a repeating cycle of states is a loop signal. Cycles are checked as each
+call arrives, and cycle signatures persist across plain result blocks, so a
+cycle is still reported when later calls in the same block follow it or when
+result blocks sit between the calls. An opt-in tool-call budget
 ceiling is available and off by default.
 
 Thresholds are policy inputs. Defaults are conservative historical starting

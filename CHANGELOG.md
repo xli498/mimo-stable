@@ -13,9 +13,27 @@ All notable changes to LLM Degenerate Loop Guardrails.
   (`repeated_ngram_within_block`).
 - Added an opt-in tool-call budget ceiling (`--max-tool-calls`,
   `inspect_events(..., max_tool_calls=N)`); off by default.
-- Tool-call identity now ignores volatile metadata keys (`request_id`,
-  `trace_id`, `created_at`, `timestamp`, `nonce`), so a loop cannot hide
-  behind regenerated request ids.
+- Tool-call identity now ignores top-level volatile metadata keys
+  (`request_id`, `trace_id`, `created_at`, `timestamp`, `nonce`), so a loop
+  cannot hide behind regenerated request ids. The same key nested inside a
+  business payload is kept: it is business content, not call metadata.
+
+### Fixed
+- Volatile-key denoising no longer strips fields nested inside a business
+  payload, so two writes that differ only in a timestamp inside the content
+  being written are no longer reported as the same call.
+- Within-block n-gram coverage is now computed over the same phrases as the
+  occurrence bar: only phrases occurring 5+ times contribute coverage.
+- Tool-call extraction no longer counts a nested example inside a JSON call
+  record as a second call, and now counts every function-style call on its
+  own line in one block; CLI and structured-API counts agree.
+- Tool-call cycles are now checked as each call arrives, so a cycle is still
+  reported when later calls in the same block follow it.
+- Function-style calls whose arguments parse as a JSON object now use the
+  same normalization and volatile-key denoising as JSON records.
+- Corrected the English README: the "consecutive output blocks" rule applies
+  to repeated identical calls, while tool-call cycles are tracked across
+  plain result blocks.
 
 ## [1.1.5] - 2026-08-28
 

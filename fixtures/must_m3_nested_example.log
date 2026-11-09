@@ -1,0 +1,2 @@
+--- BLOCK 1 at 2026-01-01T00:00:00+00:00 ---
+{"name": "read", "parameters": {"path": "config.json", "example": {"name": "send", "parameters": {"message": "example"}}}}
