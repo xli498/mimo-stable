@@ -936,6 +936,157 @@ def test_must_m7_unbalanced_multiline_prose():
     print("Must M7 unbalanced-multiline-prose regression tests passed")
 
 
+def test_must_m7_unbalanced_outer_config_prose():
+    """M7 outer-config variant (PR #3 re-review 8, residual Must):
+    a line-start prose mention whose parentheses never balance, where
+    the argument opens with an ordinary (non-tool-shaped) config JSON
+    object and the tool-shaped object is nested inside it on a later
+    line (``write({"path": "config.json", "content": {"name":
+    "send", ...}}`` with no closing ``)``). Before this fix, the outer
+    object never entered ``candidates`` (it has no top-level ``name`` +
+    ``parameters``), so the inner ``send`` candidate started on a later
+    line, outside the header line's exclusion span, and two prose
+    segments were misreported as a repeated side-effecting ``send``
+    call (CLI rc=1, API pause_and_review, total=2, tool=send). The fix
+    stretches the exclusion span to the end of the outer JSON object
+    the argument opens with, so the nested candidate falls inside it.
+    Covers the re-review's verbatim repro (via CLI stdin, via the
+    fixture, and via the structured API), the equivalent variant with
+    the ``{`` moved to the line after ``write(``, the extraction
+    layer, and the guards that a real call on a later line, a bare
+    JSON record, identical real writes, and the tool-call budget are
+    unaffected. Fixture:
+    fixtures/must_m7_unbalanced_outer_config_prose.log.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_stdin(text, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", *extra_args],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    def tool(name, arguments):
+        return {"type": "tool_call", "name": name, "arguments": arguments}
+
+    def config(request_id):
+        return {
+            "path": "config.json",
+            "content": {"name": "send", "parameters": {
+                "message": "example", "request_id": request_id}},
+        }
+
+    def segment(request_id, brace_on_next_line=False):
+        opener = "write(\n" if brace_on_next_line else "write("
+        return opener + json.dumps(config(request_id), indent=2) + "\n"
+
+    # Verbatim repro from the re-review: two unbalanced prose
+    # segments, differing only in the volatile request_id inside the
+    # nested parameters -> no loop, total 0, on both channels.
+    for brace_on_next_line in (False, True):
+        prose = (segment("1", brace_on_next_line) + "\n"
+                 + segment("2", brace_on_next_line) + "\n")
+        rc, data = cli_stdin(prose)
+        assert rc == 0 and data["loop_detected"] is False, (rc, data)
+        assert data["total_tool_calls"] == 0, data
+        api = inspect_events([segment("1", brace_on_next_line),
+                              segment("2", brace_on_next_line)])
+        assert api["loop_detected"] is False, api
+        assert api["total_tool_calls"] == 0, api
+        api = inspect_events([prose])
+        assert api["loop_detected"] is False, api
+        assert api["total_tool_calls"] == 0, api
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+         "--log", str(ROOT / "fixtures"
+                      / "must_m7_unbalanced_outer_config_prose.log")],
+        capture_output=True, text=True)
+    assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
+    data = json.loads(p.stdout)
+    assert data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 0, data
+
+    # Extraction layer: each unbalanced prose segment extracts
+    # nothing, in either brace position; an unbalanced segment
+    # followed on later lines by a real standalone call extracts
+    # only the real call.
+    detector = LoopDetector()
+    assert detector._extract_tool_calls(segment("1")) == []
+    assert detector._extract_tool_calls(segment("1", True)) == []
+    assert detector._extract_tool_calls(
+        segment("1") + "\n" + segment("2")) == []
+    assert detector._extract_tool_calls(
+        segment("1") + "\n" + 'write({"path":"audit-part"})\n') == [
+        {"name": "write", "params": '{"path": "audit-part"}'}]
+    assert detector._extract_tool_calls(
+        segment("1") + "\n"
+        + '{"name":"send","parameters":{"message":"example",'
+          '"request_id":"1"}}\n') == [
+        {"name": "send", "params": '{"message": "example"}'}]
+    # A cross-span outer read('...') candidate is retained while
+    # the nested send inside the prose segment stays excluded.
+    assert detector._extract_tool_calls(
+        "read('config.json')\n\n" + segment("1")) == [
+        {"name": "read", "params": "'config.json'"}]
+    # A non-JSON unbalanced argument must not drag a distant "{"
+    # into the span: a real JSON record after such prose still counts.
+    assert detector._extract_tool_calls(
+        "write(some prose here\nmore prose\n"
+        + '{"name":"send","parameters":{"message":"example",'
+          '"request_id":"1"}}\n') == [
+        {"name": "send", "params": '{"message": "example"}'}]
+
+    # Guards: bare JSON records are unaffected by the prose span
+    # (they have no line-start function-style header). Two identical
+    # standalone send records still alarm on both channels.
+    rc, data = cli_stdin(
+        '{"name":"send","parameters":{"message":"example",'
+        '"request_id":"1"}}\n\n'
+        '{"name":"send","parameters":{"message":"example",'
+        '"request_id":"2"}}\n\n')
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "repeated_side_effect_tool_call", data
+    assert data["details"]["tool"] == "send", data
+    assert data["total_tool_calls"] == 2, data
+    api = inspect_events([
+        '{"name":"send","parameters":{"message":"example",'
+        '"request_id":"1"}}',
+        '{"name":"send","parameters":{"message":"example",'
+        '"request_id":"2"}}'])
+    assert api["loop_detected"] is True, api
+    assert api["total_tool_calls"] == 2, api
+    # Two identical real writes still alarm on both channels.
+    rc, data = cli_stdin(
+        'write({"path":"a"})\n\nwrite({"path":"a"})\n\n')
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "repeated_side_effect_tool_call", data
+    assert data["details"]["tool"] == "write", data
+    assert data["total_tool_calls"] == 2, data
+    api = inspect_events(['write({"path":"a"})', 'write({"path":"a"})'])
+    assert api["loop_detected"] is True, api
+    assert api["total_tool_calls"] == 2, api
+    # The tool-call budget still fires on both channels.
+    rc, data = cli_stdin(
+        "browser()\n\nbrowser()\n\n", ("--max-tool-calls", "1"))
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["total_tool_calls"] == 2, data
+    api = inspect_events([tool("browser", {}), tool("browser", {})],
+                         max_tool_calls=1)
+    assert api["loop_detected"] is True, api
+    assert api["details"]["type"] == "tool_call_budget_exceeded", api
+    assert api["total_tool_calls"] == 2, api
+    # A prose segment plus one real JSON record counts exactly the
+    # real record.
+    rc, data = cli_stdin(
+        segment("1") + "\n"
+        + '{"name":"send","parameters":{"message":"example",'
+          '"request_id":"1"}}\n\n')
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 1, data
+    print("Must M7 unbalanced-outer-config-prose regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -1032,4 +1183,5 @@ if __name__ == "__main__":
     test_must_m5_with_args_prose()
     test_must_m7_tool_shape_in_prose()
     test_must_m7_unbalanced_multiline_prose()
+    test_must_m7_unbalanced_outer_config_prose()
     test_detector_behavior_contract()

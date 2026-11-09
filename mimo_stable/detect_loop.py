@@ -287,6 +287,12 @@ class LoopDetector:
         exclusion span stretches to cover a JSON candidate that
         starts on the mention's line, instead of stopping at that
         line's end (M7 unbalanced variant, PR #3 re-review 7).
+        It also holds when the argument opens with an ordinary
+        (non-tool-shaped) config JSON object and the tool-shaped
+        object is nested inside it on a later line: the span
+        stretches to the end of that outer object, so the inner
+        candidate falls inside it (M7 outer-config variant, PR #3
+        re-review 8).
         The closing parenthesis is found by a quote-aware
         scan, so a ")" inside a quoted string (or an escaped quote just
         before one) does not end the arguments early (M5 boundary); a call
@@ -300,7 +306,13 @@ class LoopDetector:
 
         # Parse JSON objects rather than matching braces. Tool parameters may
         # legitimately contain nested objects, arrays, or escaped strings.
+        # Every successfully decoded JSON object is also recorded in
+        # ``json_spans`` (tool-shaped or not): the prose-exclusion logic
+        # below needs the span of an outer config object that merely
+        # *contains* a tool-shaped object (M7 outer-config variant,
+        # PR #3 re-review 8).
         decoder = json.JSONDecoder()
+        json_spans: list[tuple[int, int]] = []
         pos = 0
         while True:
             brace = re.search(r"\{", text[pos:])
@@ -312,6 +324,7 @@ class LoopDetector:
             except (json.JSONDecodeError, ValueError):
                 pos = start + 1
                 continue
+            json_spans.append((start, start + end))
             if (
                 isinstance(candidate, dict)
                 and isinstance(candidate.get("name"), str)
@@ -376,6 +389,32 @@ class LoopDetector:
                 name_start = header.start(1)
                 line_end = text.find("\n", name_start)
                 span_end = len(text) if line_end == -1 else line_end
+                # M7 outer-config variant (PR #3 re-review 8): the
+                # argument may open with an ordinary config JSON object
+                # (e.g. ``write({"path": "config.json", "content":
+                # {"name": "send", ...}}`` with no closing paren). That
+                # outer object is not tool-shaped, so it never enters
+                # ``candidates``, and the inner ``send`` candidate starts
+                # on a later line -- outside the header's line, so the
+                # candidate-extension loop below never reaches it. When
+                # only whitespace lies between the ``(`` and the opening
+                # ``{`` of such an object (same line, or the ``{`` moved
+                # to the next line), the argument *is* that object:
+                # stretch the span to the end of it, so the nested
+                # candidate falls inside the span and the fully-inside
+                # filter drops it. The whitespace-only guard keeps a
+                # real call on a later line out of the span: anything
+                # after the outer object ends is untouched, and a
+                # non-JSON argument cannot drag a distant ``{`` into
+                # the span. The candidate-extension loop then runs over
+                # the stretched span as before.
+                open_paren = header.end() - 1
+                for obj_start, obj_end in json_spans:
+                    if obj_start >= open_paren and text[
+                        open_paren + 1:obj_start
+                    ].strip() == "":
+                        span_end = max(span_end, obj_end)
+                        break
                 for cand_start, cand_end, _ in candidates:
                     if header.start() <= cand_start < span_end:
                         span_end = max(span_end, cand_end)

@@ -63,7 +63,16 @@ All notable changes to LLM Degenerate Loop Guardrails.
   the mention's parentheses never balance and the nested JSON spans
   several lines: the exclusion span stretches to cover a JSON
   object that starts on the mention's line, instead of stopping at
-  that line's end.
+  that line's end. The same exclusion now also covers an ordinary
+  (non-tool-shaped) config JSON object that the mention's argument
+  opens with: when the parentheses never balance and the tool-shaped
+  object is nested inside that outer object on a later line (e.g.
+  `write({"path": "config.json", "content": {"name": "send", ...}}`
+  with no closing `)`), the exclusion span stretches to the end of
+  the outer object, so the inner object is no longer counted as a
+  call of its own. This also holds when the `{` is moved to the line
+  after `write(`. A real call on a later line, a bare JSON record,
+  and the tool-call budget are unaffected.
 - Corrected the English README: the "consecutive output blocks" rule applies
   to repeated identical calls, while tool-call cycles are tracked across
   plain result blocks.
