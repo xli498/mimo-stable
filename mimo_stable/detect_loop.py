@@ -270,9 +270,13 @@ class LoopDetector:
         tool-call budget -- but only when the closing ``)`` ends the
         call record: only whitespace may follow it on the same line.
         A line-start name followed by prose on the same line (e.g.
-        ``write() denotes the writer interface ...``) is ordinary
+        ``write() denotes the writer interface ...`` or
+        ``write({"path": ...}) denotes ...``) is ordinary
         documentation mentioning the tool, not a call, and is not
-        counted (line-start prose Must, PR #3 re-review 3).
+        counted (line-start prose Must, PR #3 re-review 3 for
+        zero-argument calls, re-review 4 for calls with arguments):
+        the closing ``)`` must end the call record in both branches,
+        i.e. only whitespace may follow it on the same line.
         The closing parenthesis is found by a quote-aware
         scan, so a ")" inside a quoted string (or an escaped quote just
         before one) does not end the arguments early (M5 boundary); a call
@@ -357,6 +361,16 @@ class LoopDetector:
                 params = json.dumps(
                     strip_volatile_params(parsed), sort_keys=True
                 )
+            # Same complete-call-record boundary as the zero-argument
+            # branch: the closing ")" must end the call's line (only
+            # whitespace may follow it). A line-start name with
+            # arguments followed by prose on the same line (e.g.
+            # ``write({"path": ...}) denotes ...``) is documentation
+            # mentioning the tool, not a call, and is skipped
+            # (line-start prose Must, PR #3 re-review 4). Prose on a
+            # later line does not affect the call.
+            if not self._ends_call_record(text, end):
+                continue
             candidates.append((header.start(), end, {
                 "name": tool, "params": params,
             }))

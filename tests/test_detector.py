@@ -574,6 +574,143 @@ def test_must_m5_empty_args_prose():
     print("Must M5 empty-args prose regression tests passed")
 
 
+def test_must_m5_with_args_prose():
+    """Line-start prose Must (PR #3 re-review 4): the complete-call-record
+    boundary now also applies to function-style calls *with* arguments.
+    A line-start name with arguments followed by explanatory prose on the
+    same line (``write({"path": ...}) denotes ...``) is documentation
+    mentioning the tool, not a tool call, and must not be counted -- the
+    same boundary as the zero-argument branch (only whitespace may follow
+    the closing ")" on the same line). Covers the headline repro
+    (verbatim, via CLI stdin, via the fixture, and via the structured
+    API), mid-sentence mentions, prose for every recognized tool name,
+    punctuation variants after the closing parenthesis, and the guards
+    that a standalone with-arguments call still counts and that the
+    zero-argument prose fix and the empty-args budget counting have
+    not regressed.
+    Fixture: fixtures/must_m5_with_args_prose.log.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_stdin(text, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", *extra_args],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    # Headline repro from the re-review, verbatim: two different prose
+    # lines, default mode, no budget, no real calls -> no loop, total 0.
+    # The two lines differ only in the volatile request_id, which is
+    # ignored when comparing calls, so before the fix they were reported
+    # as the same repeated side-effecting call (rc=1, total=2).
+    prose = (
+        'write({"path":"audit-part","request_id":"1"}) denotes the writer '
+        "interface in this documentation.\n\n"
+        'write({"path":"audit-part","request_id":"2"}) can also be used as '
+        "a label in the manual.\n\n"
+    )
+    rc, data = cli_stdin(prose)
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+    # Same input as a log fixture (--timeout 60 like the other must_*
+    # fixtures): still no loop and no calls at all.
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+         "--log", str(ROOT / "fixtures" / "must_m5_with_args_prose.log")],
+        capture_output=True, text=True)
+    assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
+    data = json.loads(p.stdout)
+    assert data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 0, data
+    # Same two prose lines through the structured API: also no loop and
+    # no calls (the API negative was missing for the zero-argument prose
+    # fix; it is asserted here for the with-arguments variant).
+    api = inspect_events(
+        ['write({"path":"audit-part","request_id":"1"}) denotes the writer '
+         "interface in this documentation.",
+         'write({"path":"audit-part","request_id":"2"}) can also be used as '
+         "a label in the manual."])
+    assert api["loop_detected"] is False, api
+    assert api["total_tool_calls"] == 0, api
+
+    # Mid-sentence mentions of a with-arguments call are prose too, and
+    # so is a line-start mention for every recognized tool name.
+    mid = 'Please call write({"path":"audit-part"}) to save the file.\n\n'
+    rc, data = cli_stdin(mid)
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+    for tool_name in ("read", "write", "exec", "edit", "browser",
+                      "web_fetch"):
+        rc, data = cli_stdin(
+            '%s({"path":"x"}) is described in this manual.\n\n' % tool_name)
+        assert rc == 0 and data["loop_detected"] is False, (tool_name, data)
+        assert data["total_tool_calls"] == 0, (tool_name, data)
+    # Punctuation right after the closing parenthesis is still prose on
+    # the same line: semicolon, period, comma, and Chinese full stop.
+    for suffix in (";", ".", ",", "\u3002"):
+        rc, data = cli_stdin(
+            'write({"path":"audit-part"})%s see the manual.\n\n' % suffix)
+        assert rc == 0 and data["loop_detected"] is False, (suffix, data)
+        assert data["total_tool_calls"] == 0, (suffix, data)
+    # An indented line-start mention is prose as well.
+    rc, data = cli_stdin(
+        '  write({"path":"audit-part"}) denotes the writer interface.\n\n')
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+
+    # Extraction layer: prose lines extract nothing; a standalone
+    # with-arguments call on its own line still extracts, even with
+    # trailing spaces or prose on the following line, and a prose line
+    # followed by a real call extracts only the real call.
+    detector = LoopDetector()
+    assert detector._extract_tool_calls(prose) == []
+    assert detector._extract_tool_calls(
+        'write({"path":"audit-part","request_id":"1"}) denotes the writer '
+        "interface in this documentation.") == []
+    assert detector._extract_tool_calls(
+        'write({"path":"audit-part","request_id":"2"}) can also be used as '
+        "a label in the manual.") == []
+    assert detector._extract_tool_calls('write({"path":"audit-part"})') == [
+        {"name": "write", "params": '{"path": "audit-part"}'}]
+    assert detector._extract_tool_calls(
+        'write({"path":"audit-part"})   \n\n') == [
+        {"name": "write", "params": '{"path": "audit-part"}'}]
+    assert detector._extract_tool_calls(
+        'write({"path":"audit-part"})\ndenotes the writer interface.\n\n'
+        ) == [{"name": "write", "params": '{"path": "audit-part"}'}]
+    assert detector._extract_tool_calls(
+        'write({"path":"audit-part"}) denotes the writer interface.\n\n'
+        'write({"path":"audit-part"})\n\n') == [
+        {"name": "write", "params": '{"path": "audit-part"}'}]
+
+    # Guard: a standalone with-arguments call still counts. Two identical
+    # standalone writes trip the side-effect rule (before the budget rule),
+    # so the expected type is repeated_side_effect_tool_call with total 2.
+    rc, data = cli_stdin(
+        'write({"path":"audit-part"})\n\n'
+        'write({"path":"audit-part"})\n\n',
+        ("--max-tool-calls", "1"))
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "repeated_side_effect_tool_call", data
+    assert data["total_tool_calls"] == 2, data
+
+    # Guards against regressing the zero-argument prose fix and the
+    # empty-args budget counting.
+    zero_prose = (
+        "write() denotes the writer interface in this documentation.\n\n"
+        "write() can also be used as a label in the manual.\n\n"
+    )
+    rc, data = cli_stdin(zero_prose)
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+    rc, data = cli_stdin("browser()\n\nbrowser()\n\n",
+                         ("--max-tool-calls", "1"))
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["total_tool_calls"] == 2, data
+    print("Must M5 with-args prose regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -667,4 +804,5 @@ if __name__ == "__main__":
     test_must_m5_paren_in_string()
     test_must_m5_empty_args()
     test_must_m5_empty_args_prose()
+    test_must_m5_with_args_prose()
     test_detector_behavior_contract()

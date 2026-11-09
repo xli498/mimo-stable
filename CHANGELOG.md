@@ -46,6 +46,13 @@ All notable changes to LLM Degenerate Loop Guardrails.
   ...`) is no longer misreported as a repeated side-effecting call;
   a standalone `browser()` on its own line still counts exactly as
   before.
+- The same complete-call-record boundary now also applies to
+  function-style calls *with* arguments: a line-start name with
+  arguments followed by prose on the same line (e.g.
+  `write({"path": ...}) denotes ...`) is documentation mentioning the
+  tool, not a call, and is no longer misreported as a repeated
+  side-effecting call; a standalone `write({...})` on its own line
+  still counts exactly as before.
 - Corrected the English README: the "consecutive output blocks" rule applies
   to repeated identical calls, while tool-call cycles are tracked across
   plain result blocks.
