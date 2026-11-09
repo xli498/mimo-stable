@@ -233,6 +233,20 @@ class LoopDetector:
             index += 1
         return None
 
+    @staticmethod
+    def _ends_call_record(text: str, end: int) -> bool:
+        """Return True when ``end`` (just past ``)``) ends a call record.
+
+        A complete function-style call record occupies its line: only
+        whitespace may follow the closing parenthesis before the end of
+        the line (or of the text). Anything else on the same line -- a
+        word, punctuation, another token -- means the line-start name
+        is prose mentioning the tool (e.g. ``write() denotes ...``),
+        not a call. Prose on a *later* line does not affect the call:
+        only the remainder of the call's own line is examined.
+        """
+        return text[end:].split("\n", 1)[0].strip() == ""
+
     def _extract_tool_calls(self, text: str) -> list[dict]:
         """Extract tool call signatures from model output text.
 
@@ -253,7 +267,13 @@ class LoopDetector:
         verbatim (M5). A zero-argument call (``browser()``) counts with
         params ``"{}"``, the same normalized form the structured API
         produces for ``arguments: {}``, so CLI and API agree on the
-        tool-call budget. The closing parenthesis is found by a quote-aware
+        tool-call budget -- but only when the closing ``)`` ends the
+        call record: only whitespace may follow it on the same line.
+        A line-start name followed by prose on the same line (e.g.
+        ``write() denotes the writer interface ...``) is ordinary
+        documentation mentioning the tool, not a call, and is not
+        counted (line-start prose Must, PR #3 re-review 3).
+        The closing parenthesis is found by a quote-aware
         scan, so a ")" inside a quoted string (or an escaped quote just
         before one) does not end the arguments early (M5 boundary); a call
         whose parentheses never balance is not counted at all, because an
@@ -317,7 +337,13 @@ class LoopDetector:
                 # params normalized to "{}" exactly as the structured API
                 # normalizes ``arguments: {}``. Dropping it here made the
                 # CLI silently disagree with the API on the tool-call
-                # budget (empty-args Must, PR #3 re-review 2).
+                # budget (empty-args Must, PR #3 re-review 2). But the
+                # call must end its line: a line-start name followed by
+                # prose on the same line (``write() denotes ...``) is
+                # documentation mentioning the tool, not a call, and is
+                # skipped (line-start prose Must, PR #3 re-review 3).
+                if not self._ends_call_record(text, end):
+                    continue
                 candidates.append((header.start(), end, {
                     "name": tool, "params": "{}",
                 }))

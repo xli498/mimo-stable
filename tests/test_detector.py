@@ -478,6 +478,102 @@ def test_must_m5_empty_args():
     print("Must M5 empty-args regression tests passed")
 
 
+def test_must_m5_empty_args_prose():
+    """Line-start prose Must (PR #3 re-review 3): a zero-argument
+    function-style name at the start of a line followed by explanatory
+    prose on the same line (``write() denotes ...``) is documentation
+    mentioning the tool, not a tool call, and must not be counted. The
+    complete-call-record boundary is that only whitespace may follow
+    the closing ")" on the same line. Covers the headline repro
+    (verbatim, via CLI stdin and via the fixture), mid-sentence
+    mentions, prose for every recognized tool name, and the guard that
+    a standalone ``browser()`` still counts (empty-args Must must not
+    regress): two standalone calls at a budget of 1 still breach it.
+    Fixture: fixtures/must_m5_empty_args_prose.log.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_stdin(text, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", *extra_args],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    # Headline repro from the re-review, verbatim: two different prose
+    # lines, default mode, no budget, no real calls -> no loop, total 0.
+    prose = (
+        "write() denotes the writer interface in this documentation.\n\n"
+        "write() can also be used as a label in the manual.\n\n"
+    )
+    rc, data = cli_stdin(prose)
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+    # Same input as a log fixture (--timeout 60 like the other must_*
+    # fixtures): still no loop and no calls at all.
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+         "--log", str(ROOT / "fixtures" / "must_m5_empty_args_prose.log")],
+        capture_output=True, text=True)
+    assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
+    data = json.loads(p.stdout)
+    assert data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 0, data
+
+    # Mid-sentence mentions of a zero-argument call are prose too, and
+    # so is a line-start mention for every recognized tool name.
+    mid = "Please call browser() to fetch the page.\n\n"
+    rc, data = cli_stdin(mid)
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+    for tool_name in ("read", "write", "exec", "edit", "browser",
+                      "web_fetch"):
+        rc, data = cli_stdin(
+            "%s() is described in this manual.\n\n" % tool_name)
+        assert rc == 0 and data["loop_detected"] is False, (tool_name, data)
+        assert data["total_tool_calls"] == 0, (tool_name, data)
+    # An indented line-start mention is prose as well.
+    rc, data = cli_stdin("  write() denotes the writer interface.\n\n")
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+
+    # Extraction layer: prose lines extract nothing; a standalone call
+    # on its own line still extracts, even with trailing spaces or
+    # prose on the following line.
+    detector = LoopDetector()
+    assert detector._extract_tool_calls(prose) == []
+    assert detector._extract_tool_calls(
+        "write() denotes the writer interface in this documentation.") == []
+    assert detector._extract_tool_calls(
+        "write() can also be used as a label in the manual.") == []
+    assert detector._extract_tool_calls("browser()") == [
+        {"name": "browser", "params": "{}"}]
+    assert detector._extract_tool_calls("browser()   \n\n") == [
+        {"name": "browser", "params": "{}"}]
+    assert detector._extract_tool_calls(
+        "browser()\ndenotes the writer interface.\n\n") == [
+        {"name": "browser", "params": "{}"}]
+    assert detector._extract_tool_calls(
+        "write() denotes the writer interface.\n\nbrowser()\n\n") == [
+        {"name": "browser", "params": "{}"}]
+
+    # Guard against regressing the empty-args fix: two standalone
+    # browser() calls at a budget of 1 still breach the budget, CLI
+    # and structured API in agreement.
+    rc, data = cli_stdin("browser()\n\nbrowser()\n\n",
+                         ("--max-tool-calls", "1"))
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["total_tool_calls"] == 2, data
+    api = inspect_events(
+        [{"type": "tool_call", "name": "browser", "arguments": {}},
+         {"type": "tool_call", "name": "browser", "arguments": {}}],
+        max_tool_calls=1)
+    assert api["loop_detected"] is True, api
+    assert api["details"]["type"] == "tool_call_budget_exceeded", api
+    assert api["total_tool_calls"] == 2, api
+    print("Must M5 empty-args prose regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -570,4 +666,5 @@ if __name__ == "__main__":
     test_must_regressions_m1_to_m6()
     test_must_m5_paren_in_string()
     test_must_m5_empty_args()
+    test_must_m5_empty_args_prose()
     test_detector_behavior_contract()

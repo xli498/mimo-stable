@@ -39,6 +39,13 @@ All notable changes to LLM Degenerate Loop Guardrails.
   with params normalized to `{}`, exactly as the structured API counts
   `arguments: {}`; previously the CLI silently dropped them and could
   miss a tool-call budget breach the API would report.
+- A zero-argument function-style name at the start of a line is only
+  counted as a call when the closing `)` ends the call record (only
+  whitespace may follow it on the same line). Ordinary prose that
+  mentions a tool this way (e.g. `write() denotes the writer interface
+  ...`) is no longer misreported as a repeated side-effecting call;
+  a standalone `browser()` on its own line still counts exactly as
+  before.
 - Corrected the English README: the "consecutive output blocks" rule applies
   to repeated identical calls, while tool-call cycles are tracked across
   plain result blocks.
