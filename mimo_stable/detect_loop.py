@@ -282,7 +282,11 @@ class LoopDetector:
         ``write({"name": "send", ...}) denotes ...``): the JSON scan
         runs first and would otherwise leave that inner candidate
         standing after the outer mention is dropped (M7, PR #3
-        re-review 6).
+        re-review 6). The same holds when the parentheses never
+        balance and the nested JSON spans several lines: the
+        exclusion span stretches to cover a JSON candidate that
+        starts on the mention's line, instead of stopping at that
+        line's end (M7 unbalanced variant, PR #3 re-review 7).
         The closing parenthesis is found by a quote-aware
         scan, so a ")" inside a quoted string (or an escaped quote just
         before one) does not end the arguments early (M5 boundary); a call
@@ -352,12 +356,30 @@ class LoopDetector:
                 # here, so the line-start mention is prose; exclude any
                 # tool-shaped JSON candidate on the same line (up to the
                 # end of the header's line only, so later lines are
-                # unaffected).
-                line_end = text.find("\n", header.start())
-                excluded_spans.append((
-                    header.start(),
-                    len(text) if line_end == -1 else line_end,
-                ))
+                # unaffected). A tool-shaped JSON candidate that *starts*
+                # on the header's line may itself span several lines
+                # (e.g. ``write({\n "name": "send", ...\n}`` with no
+                # closing paren): the span must stretch to cover that
+                # whole candidate, or the fully-inside filter below
+                # keeps it and the prose mention is undone by its inner
+                # ``send`` (M7 unbalanced variant, PR #3 re-review 7).
+                # Only candidates starting inside the span extend it;
+                # a candidate starting on a later line (e.g. a real
+                # call after the prose) is untouched, and a candidate
+                # that merely overlaps from before the header is not
+                # swallowed either. The header's line is measured from
+                # the tool name, not from the match start: the leading
+                # ``\s*`` in the header pattern can swallow the
+                # preceding newline, which would otherwise make the
+                # line end the previous (blank) line and miss a
+                # candidate starting on the header's own line.
+                name_start = header.start(1)
+                line_end = text.find("\n", name_start)
+                span_end = len(text) if line_end == -1 else line_end
+                for cand_start, cand_end, _ in candidates:
+                    if header.start() <= cand_start < span_end:
+                        span_end = max(span_end, cand_end)
+                excluded_spans.append((header.start(), span_end))
                 continue
             args, end = scanned
             args = args.strip()

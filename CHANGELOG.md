@@ -59,7 +59,11 @@ All notable changes to LLM Degenerate Loop Guardrails.
   inner object is no longer counted as a call of its own, so such
   prose is no longer misreported as a repeated side-effecting call;
   a standalone `write({...})` on its own line still counts exactly
-  as before, extracting only the outer call.
+  as before, extracting only the outer call. This also holds when
+  the mention's parentheses never balance and the nested JSON spans
+  several lines: the exclusion span stretches to cover a JSON
+  object that starts on the mention's line, instead of stopping at
+  that line's end.
 - Corrected the English README: the "consecutive output blocks" rule applies
   to repeated identical calls, while tool-call cycles are tracked across
   plain result blocks.
