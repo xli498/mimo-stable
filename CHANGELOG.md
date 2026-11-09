@@ -53,6 +53,13 @@ All notable changes to LLM Degenerate Loop Guardrails.
   tool, not a call, and is no longer misreported as a repeated
   side-effecting call; a standalone `write({...})` on its own line
   still counts exactly as before.
+- The line-start prose exclusion now also covers a tool-shaped JSON
+  object nested inside the excluded mention's arguments (e.g. the
+  `send` inside `write({"name": "send", ...}) denotes ...`): the
+  inner object is no longer counted as a call of its own, so such
+  prose is no longer misreported as a repeated side-effecting call;
+  a standalone `write({...})` on its own line still counts exactly
+  as before, extracting only the outer call.
 - Corrected the English README: the "consecutive output blocks" rule applies
   to repeated identical calls, while tool-call cycles are tracked across
   plain result blocks.

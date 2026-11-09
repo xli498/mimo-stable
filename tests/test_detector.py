@@ -711,6 +711,141 @@ def test_must_m5_with_args_prose():
     print("Must M5 with-args prose regression tests passed")
 
 
+def test_must_m7_tool_shape_in_prose():
+    """Tool-shape JSON inside prose Must (PR #3 re-review 6, M7): the
+    line-start prose exclusion must also cover a tool-shaped JSON object
+    nested inside the excluded mention's arguments. Before the fix, the
+    JSON scan recorded the inner ``send`` of
+    ``write({"name": "send", ...}) denotes ...`` and, once the outer
+    ``write`` was excluded as prose, the overlap dedup kept the inner
+    ``send`` -- so two prose lines were misreported as a repeated
+    side-effecting ``send`` call (CLI rc=1, API pause_and_review,
+    total=2). Covers the headline repro (verbatim, via CLI stdin, via
+    the fixture, and via the structured API), the closer-to-real
+    ``config.json``/``content`` nesting variant, the extraction layer
+    (prose extracts nothing; a standalone outer record extracts only
+    the outer ``write``), and the guards that real standalone calls
+    still count and still alarm.
+    Fixture: fixtures/must_m7_tool_shape_in_prose.log.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_stdin(text, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", *extra_args],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    # Headline repro from the re-review, verbatim: two different prose
+    # lines whose arguments contain a tool-shaped JSON object, default
+    # mode, no budget, no real calls -> no loop, total 0. The two lines
+    # differ only in the volatile request_id inside the nested
+    # parameters, which is ignored when comparing calls, so before the
+    # fix they were reported as the same repeated side-effecting call
+    # (rc=1, total=2, tool=send).
+    prose = (
+        'write({"name":"send","parameters":{"message":"example",'
+        '"request_id":"1"}}) denotes the writer interface in this '
+        "documentation.\n\n"
+        'write({"name":"send","parameters":{"message":"example",'
+        '"request_id":"2"}}) can also be used as a label in the '
+        "manual.\n\n"
+    )
+    rc, data = cli_stdin(prose)
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+    # Same input as a log fixture (--timeout 60 like the other must_*
+    # fixtures): still no loop and no calls at all.
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+         "--log", str(ROOT / "fixtures" / "must_m7_tool_shape_in_prose.log")],
+        capture_output=True, text=True)
+    assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
+    data = json.loads(p.stdout)
+    assert data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 0, data
+    # Same two prose lines through the structured API: also no loop and
+    # no calls.
+    api = inspect_events(
+        ['write({"name":"send","parameters":{"message":"example",'
+         '"request_id":"1"}}) denotes the writer interface in this '
+         "documentation.",
+         'write({"name":"send","parameters":{"message":"example",'
+         '"request_id":"2"}}) can also be used as a label in the '
+         "manual."])
+    assert api["loop_detected"] is False, api
+    assert api["total_tool_calls"] == 0, api
+
+    # Closer-to-real file-writing prose: the tool-shaped JSON is nested
+    # one level deeper, inside a "content" object. Same expectation on
+    # both channels.
+    variant = (
+        'write({"path":"config.json","content":{"name":"send",'
+        '"parameters":{"message":"example","request_id":"1"}}}) denotes '
+        "the writer interface in this documentation.\n\n"
+        'write({"path":"config.json","content":{"name":"send",'
+        '"parameters":{"message":"example","request_id":"2"}}}) can also '
+        "be used as a label in the manual.\n\n"
+    )
+    rc, data = cli_stdin(variant)
+    assert rc == 0 and data["loop_detected"] is False, (rc, data)
+    assert data["total_tool_calls"] == 0, data
+    api = inspect_events(
+        [line for line in variant.split("\n\n") if line.strip()])
+    assert api["loop_detected"] is False, api
+    assert api["total_tool_calls"] == 0, api
+
+    # Extraction layer: prose lines extract nothing; a standalone outer
+    # record extracts only the outer write (never the inner send), even
+    # with trailing spaces; a prose line followed by a real call
+    # extracts only the real call.
+    detector = LoopDetector()
+    assert detector._extract_tool_calls(prose) == []
+    assert detector._extract_tool_calls(variant) == []
+    assert detector._extract_tool_calls(
+        'write({"name":"send","parameters":{"message":"example",'
+        '"request_id":"1"}})') == [
+        {"name": "write",
+         "params": '{"name": "send", "parameters": {"message": "example", '
+                   '"request_id": "1"}}'}]
+    assert detector._extract_tool_calls(
+        'write({"name":"send","parameters":{"message":"example",'
+        '"request_id":"1"}})   \n\n') == [
+        {"name": "write",
+         "params": '{"name": "send", "parameters": {"message": "example", '
+                   '"request_id": "1"}}'}]
+    assert detector._extract_tool_calls(
+        'write({"name":"send","parameters":{"message":"example",'
+        '"request_id":"1"}}) denotes the writer interface.\n\n'
+        'write({"name":"send","parameters":{"message":"example",'
+        '"request_id":"1"}})\n\n') == [
+        {"name": "write",
+         "params": '{"name": "send", "parameters": {"message": "example", '
+                   '"request_id": "1"}}'}]
+
+    # Guards: real standalone calls still count. Two identical
+    # standalone writes trip the side-effect rule (CLI and API, default
+    # mode), and the tool-call budget still fires for two standalone
+    # calls under a budget of 1.
+    rc, data = cli_stdin(
+        'write({"path":"audit-part"})\n\n'
+        'write({"path":"audit-part"})\n\n')
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "repeated_side_effect_tool_call", data
+    assert data["total_tool_calls"] == 2, data
+    api = inspect_events(
+        ['write({"path":"audit-part"})', 'write({"path":"audit-part"})'])
+    assert api["loop_detected"] is True, api
+    assert api["details"]["type"] == "repeated_side_effect_tool_call", api
+    assert api["total_tool_calls"] == 2, api
+    rc, data = cli_stdin("browser()\n\nbrowser()\n\n",
+                         ("--max-tool-calls", "1"))
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "tool_call_budget_exceeded", data
+    assert data["total_tool_calls"] == 2, data
+    print("Must M7 tool-shape-in-prose regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -805,4 +940,5 @@ if __name__ == "__main__":
     test_must_m5_empty_args()
     test_must_m5_empty_args_prose()
     test_must_m5_with_args_prose()
+    test_must_m7_tool_shape_in_prose()
     test_detector_behavior_contract()

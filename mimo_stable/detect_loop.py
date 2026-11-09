@@ -276,7 +276,13 @@ class LoopDetector:
         counted (line-start prose Must, PR #3 re-review 3 for
         zero-argument calls, re-review 4 for calls with arguments):
         the closing ``)`` must end the call record in both branches,
-        i.e. only whitespace may follow it on the same line.
+        i.e. only whitespace may follow it on the same line. The prose
+        exclusion also covers a tool-shaped JSON object nested inside
+        the excluded mention's arguments (e.g. the ``send`` inside
+        ``write({"name": "send", ...}) denotes ...``): the JSON scan
+        runs first and would otherwise leave that inner candidate
+        standing after the outer mention is dropped (M7, PR #3
+        re-review 6).
         The closing parenthesis is found by a quote-aware
         scan, so a ")" inside a quoted string (or an escaped quote just
         before one) does not end the arguments early (M5 boundary); a call
@@ -329,10 +335,29 @@ class LoopDetector:
             r"^\s*(read|write|exec|edit|browser|web_fetch)\s*\(",
             re.IGNORECASE | re.MULTILINE,
         )
+        # Spans of line-start function-style mentions that the
+        # complete-call-record check rejected as prose (M7): a prose
+        # mention's arguments may themselves contain a tool-shaped JSON
+        # object (e.g. ``write({"name": "send", ...}) denotes ...``),
+        # which the JSON scan above already recorded as a candidate for
+        # the inner ``send``. The prose exclusion must cover those inner
+        # candidates too, or the outer exclusion is undone by the inner
+        # one surviving the overlap dedup below.
+        excluded_spans: list[tuple[int, int]] = []
         for header in func_header.finditer(text):
             tool = header.group(1).lower()
             scanned = self._scan_balanced_parens(text, header.end() - 1)
             if scanned is None:
+                # Parentheses never balance: there is no complete call
+                # here, so the line-start mention is prose; exclude any
+                # tool-shaped JSON candidate on the same line (up to the
+                # end of the header's line only, so later lines are
+                # unaffected).
+                line_end = text.find("\n", header.start())
+                excluded_spans.append((
+                    header.start(),
+                    len(text) if line_end == -1 else line_end,
+                ))
                 continue
             args, end = scanned
             args = args.strip()
@@ -347,6 +372,7 @@ class LoopDetector:
                 # documentation mentioning the tool, not a call, and is
                 # skipped (line-start prose Must, PR #3 re-review 3).
                 if not self._ends_call_record(text, end):
+                    excluded_spans.append((header.start(), end))
                     continue
                 candidates.append((header.start(), end, {
                     "name": tool, "params": "{}",
@@ -370,10 +396,30 @@ class LoopDetector:
             # (line-start prose Must, PR #3 re-review 4). Prose on a
             # later line does not affect the call.
             if not self._ends_call_record(text, end):
+                excluded_spans.append((header.start(), end))
                 continue
             candidates.append((header.start(), end, {
                 "name": tool, "params": params,
             }))
+
+        # Drop any candidate fully inside a prose-excluded function-style
+        # span (M7). The JSON scan runs before the function-style prose
+        # check, so without this the inner tool-shaped JSON of a prose
+        # mention (e.g. the ``send`` inside
+        # ``write({"name": "send", ...}) denotes ...``) would survive
+        # even though the outer mention was correctly excluded. A real
+        # standalone call passes the record check and is never in an
+        # excluded span, so it is unaffected; the overlap dedup below
+        # still drops inner candidates of a kept outer call.
+        if excluded_spans:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if not any(
+                    candidate[0] >= start and candidate[1] <= end
+                    for start, end in excluded_spans
+                )
+            ]
 
         # Keep candidates in text order, dropping any candidate strictly
         # inside one that starts earlier (the outer construct wins).
