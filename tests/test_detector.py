@@ -270,6 +270,106 @@ def test_must_regressions_m1_to_m6():
     print("Must M1-M6 regression tests passed")
 
 
+def test_must_m5_paren_in_string():
+    """M5 boundary (PR #3 re-review): a ")" inside a quoted JSON string
+    value must not truncate function-style arguments.
+
+    Three writes to different paths that each contain ")" must agree
+    between CLI and structured API (loop_detected=false, total_tool_calls=3);
+    the same holds when the ")" follows an escaped quote. Truly identical
+    repeated writes to one such path must still fire on both channels.
+    Fixture: fixtures/must_m5_paren_in_string.log.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_stdin(text):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json"],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    def tool(name, arguments):
+        return {"type": "tool_call", "name": name, "arguments": arguments}
+
+    # Fixture (log file, --timeout 60 like the other must_* fixtures).
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+         "--log", str(ROOT / "fixtures" / "must_m5_paren_in_string.log")],
+        capture_output=True, text=True)
+    assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
+    data = json.loads(p.stdout)
+    assert data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 3, data
+
+    # CLI stdin and structured API agree on the same three calls.
+    func_text = "\n\n".join(
+        'write({"path":"audit)part%d","request_id":"%d"})' % (i, i)
+        for i in (1, 2, 3)) + "\n\n"
+    rc, func_data = cli_stdin(func_text)
+    assert rc == 0 and func_data["loop_detected"] is False, func_data
+    assert func_data["total_tool_calls"] == 3, func_data
+    json_text = "\n\n".join(
+        json.dumps({"name": "write", "parameters": {
+            "path": "audit)part%d" % i, "request_id": str(i)}})
+        for i in (1, 2, 3)) + "\n\n"
+    rc, json_data = cli_stdin(json_text)
+    assert rc == 0 and json_data["loop_detected"] is False, json_data
+    assert json_data["total_tool_calls"] == 3, json_data
+    api = inspect_events(
+        [tool("write", {"path": "audit)part%d" % i, "request_id": str(i)})
+         for i in (1, 2, 3)], text_mode="instant")
+    assert api["loop_detected"] is False and api["total_tool_calls"] == 3, api
+
+    # Escaped quote immediately before ")": still three distinct calls.
+    esc_paths = ['audit\\")part1', 'audit")part2', 'audit")part3']
+    esc_text = "\n\n".join(
+        "write(%s)" % json.dumps({"path": path, "request_id": str(i)})
+        for i, path in enumerate(esc_paths, start=1)) + "\n\n"
+    rc, esc_data = cli_stdin(esc_text)
+    assert rc == 0 and esc_data["loop_detected"] is False, esc_data
+    assert esc_data["total_tool_calls"] == 3, esc_data
+    esc_api = inspect_events(
+        [tool("write", {"path": path, "request_id": str(i)})
+         for i, path in enumerate(esc_paths, start=1)], text_mode="instant")
+    assert esc_api["loop_detected"] is False, esc_api
+    assert esc_api["total_tool_calls"] == 3, esc_api
+
+    # Positive control: identical writes to one ")" path still fire.
+    same_text = "\n\n".join(
+        'write({"path":"audit)part1","request_id":"%d"})' % i
+        for i in (1, 2, 3)) + "\n\n"
+    rc, same_data = cli_stdin(same_text)
+    assert rc == 1 and same_data["loop_detected"] is True, same_data
+    assert same_data["details"]["type"] == "repeated_side_effect_tool_call", same_data
+    same_api = inspect_events(
+        [tool("write", {"path": "audit)part1", "request_id": str(i)})
+         for i in (1, 2, 3)], text_mode="instant")
+    assert same_api["loop_detected"] is True, same_api
+    assert same_api["details"]["type"] == "repeated_side_effect_tool_call", same_api
+
+    # Extraction layer: full arguments, no truncation; nested parens outside
+    # strings count; an unclosed call contributes no call at all.
+    detector = LoopDetector()
+    extracted = detector._extract_tool_calls(
+        'write({"path":"audit)part1","request_id":"1"})')
+    assert extracted == [{"name": "write",
+                          "params": json.dumps({"path": "audit)part1"},
+                                               sort_keys=True)}], extracted
+    assert detector._extract_tool_calls("exec(foo(bar))") == [
+        {"name": "exec", "params": "foo(bar)"}]
+    assert detector._extract_tool_calls(
+        'write({"path":"audit)part1","request_id":"1"}') == []
+
+    # Prose guard still holds for write mid-line.
+    prose = ("I will write (the summary) later.\n\n"
+             "I will write (the appendix) later.\n\n"
+             "I will write (the checklist) later.\n\n")
+    rc, prose_data = cli_stdin(prose)
+    assert rc == 0 and prose_data["loop_detected"] is False, prose_data
+    assert prose_data["total_tool_calls"] == 0, prose_data
+    print("Must M5 paren-in-string regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -360,4 +460,5 @@ if __name__ == "__main__":
     test_runtime_facade_contract()
     test_new_signals_contract()
     test_must_regressions_m1_to_m6()
+    test_must_m5_paren_in_string()
     test_detector_behavior_contract()

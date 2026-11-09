@@ -31,6 +31,10 @@ All notable changes to LLM Degenerate Loop Guardrails.
   reported when later calls in the same block follow it.
 - Function-style calls whose arguments parse as a JSON object now use the
   same normalization and volatile-key denoising as JSON records.
+- Function-style call arguments are now scanned with quote awareness, so a
+  ")" inside a quoted JSON string value (or an escaped quote just before
+  one) no longer truncates the arguments or misreports distinct writes as
+  a repeated side-effecting call; CLI and structured-API counts agree.
 - Corrected the English README: the "consecutive output blocks" rule applies
   to repeated identical calls, while tool-call cycles are tracked across
   plain result blocks.

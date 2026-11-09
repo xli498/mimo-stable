@@ -196,6 +196,43 @@ class LoopDetector:
         cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
         return latin >= 10 and cjk == 0
 
+    @staticmethod
+    def _scan_balanced_parens(text: str, open_index: int) -> tuple[str, int] | None:
+        """Return (arguments, end) for the call opening at ``open_index``.
+
+        Scans for the parenthesis matching the ``(`` at ``open_index``,
+        ignoring parentheses inside single- or double-quoted strings and
+        honouring backslash escapes inside them, so a ``)`` in a JSON
+        string value (or an escaped quote just before one) does not end
+        the arguments early (M5 boundary). Nested parentheses outside
+        strings are counted. Returns ``None`` when the parentheses never
+        balance: an unparseable prefix must never be used as a call
+        signature. ``end`` is the index just past the closing ``)``.
+        """
+        depth = 0
+        quote: str | None = None
+        index = open_index
+        while index < len(text):
+            char = text[index]
+            if quote is not None:
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[open_index + 1:index], index + 1
+            index += 1
+        return None
+
     def _extract_tool_calls(self, text: str) -> list[dict]:
         """Extract tool call signatures from model output text.
 
@@ -213,7 +250,12 @@ class LoopDetector:
         When a function-style argument parses as a JSON object it is
         normalized exactly like a JSON record (keys sorted, top-level
         volatile keys ignored); any other argument syntax is compared
-        verbatim (M5). When a JSON record and a function-style call overlap
+        verbatim (M5). The closing parenthesis is found by a quote-aware
+        scan, so a ")" inside a quoted string (or an escaped quote just
+        before one) does not end the arguments early (M5 boundary); a call
+        whose parentheses never balance is not counted at all, because an
+        unparseable argument prefix must never be used as a call signature.
+        When a JSON record and a function-style call overlap
         in the text, only the outer construct is kept, so the same call is
         never counted twice.
         """
@@ -253,10 +295,20 @@ class LoopDetector:
 
         # Function-style calls must begin a line. This avoids treating normal
         # prose such as "I will edit (the draft)" as an actual tool invocation.
-        func_pattern = r"^\s*(read|write|exec|edit|browser|web_fetch)\s*\(([^)]*)\)"
-        for match in re.finditer(func_pattern, text, re.IGNORECASE | re.MULTILINE):
-            tool = match.group(1).lower()
-            args = match.group(2).strip()
+        # The arguments are not captured with a regex: the closing parenthesis
+        # is found by a quote-aware scan, so a ")" inside a quoted string
+        # does not truncate the arguments (M5 boundary).
+        func_header = re.compile(
+            r"^\s*(read|write|exec|edit|browser|web_fetch)\s*\(",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        for header in func_header.finditer(text):
+            tool = header.group(1).lower()
+            scanned = self._scan_balanced_parens(text, header.end() - 1)
+            if scanned is None:
+                continue
+            args, end = scanned
+            args = args.strip()
             if not args:
                 continue
             params: str = args
@@ -268,7 +320,7 @@ class LoopDetector:
                 params = json.dumps(
                     strip_volatile_params(parsed), sort_keys=True
                 )
-            candidates.append((match.start(), match.end(), {
+            candidates.append((header.start(), end, {
                 "name": tool, "params": params,
             }))
 
