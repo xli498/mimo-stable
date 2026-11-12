@@ -551,6 +551,104 @@ class LoopDetector:
         parts.append(text[pos:])
         return "".join(parts).strip()
 
+    @staticmethod
+    def _extend_spans_with_envelopes(
+        text: str, spans: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """Extend call-record spans to their pure JSON envelope (N2).
+
+        A tool call is often wrapped in an outer object such as
+        ``{"role": "assistant", "tool_calls": [<call>]}``. Stripping
+        only the inner call record leaves the envelope's key names
+        (``role`` / ``assistant`` / ``tool_calls``) behind, and kind
+        inference then mistakes those bare JSON tokens for English
+        prose -- a pure tool sequence drifts in a Chinese task (N2,
+        review round 11). The envelope is stripped together with the
+        call, but only when it is *pure*: every string key/value in
+        the envelope outside the call records themselves must be a
+        single token with no whitespace and no CJK characters. An
+        envelope carrying real prose (e.g. a multi-word ``"note"``
+        value) is left in place, so prose hidden inside a wrapper
+        still counts as text exactly as an unwrapped mixed block
+        does (N1). Returns sorted, non-overlapping spans.
+        """
+        if not spans:
+            return list(spans)
+        decoder = json.JSONDecoder()
+        objects: list[tuple[int, int, object]] = []
+        pos = 0
+        while True:
+            brace = re.search(r"\{", text[pos:])
+            if brace is None:
+                break
+            start = pos + brace.start()
+            try:
+                candidate, end = decoder.raw_decode(text[start:])
+            except (json.JSONDecodeError, ValueError):
+                pos = start + 1
+                continue
+            objects.append((start, start + end, candidate))
+            pos = start + 1
+
+        def _is_tool_call(value: object) -> bool:
+            return (
+                isinstance(value, dict)
+                and isinstance(value.get("name"), str)
+                and isinstance(value.get("parameters"), dict)
+            )
+
+        def _envelope_has_prose(value: object) -> bool:
+            """True when a non-call string in ``value`` reads as prose."""
+            if isinstance(value, dict):
+                if _is_tool_call(value):
+                    return False
+                for key, item in value.items():
+                    if isinstance(key, str) and (
+                        any(ch.isspace() for ch in key)
+                        or re.search(r"[\u4e00-\u9fff]", key)
+                    ):
+                        return True
+                    if key == "tool_calls" and isinstance(item, list):
+                        # Call records (and anything nested in them)
+                        # are the envelope's payload, not prose.
+                        continue
+                    if _envelope_has_prose(item):
+                        return True
+                return False
+            if isinstance(value, list):
+                return any(_envelope_has_prose(item) for item in value)
+            if isinstance(value, str):
+                return (
+                    any(ch.isspace() for ch in value)
+                    or re.search(r"[\u4e00-\u9fff]", value) is not None
+                )
+            return False
+
+        extended = list(spans)
+        for start, end in spans:
+            # Smallest JSON object strictly containing this call record.
+            containing = [
+                (obj_start, obj_end, obj)
+                for obj_start, obj_end, obj in objects
+                if obj_start <= start and end <= obj_end
+                and (obj_start, obj_end) != (start, end)
+            ]
+            if not containing:
+                continue
+            obj_start, obj_end, obj = min(
+                containing, key=lambda item: item[1] - item[0]
+            )
+            if isinstance(obj, dict) and not _envelope_has_prose(obj):
+                extended.append((obj_start, obj_end))
+        extended.sort()
+        merged: list[tuple[int, int]] = []
+        for start, end in extended:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
     def _check_tool_cycle(self):
         """Detect a repeating tool-call cycle (A-B-A-B, up to 4-step patterns).
 
@@ -753,7 +851,10 @@ class LoopDetector:
                 # from a Chinese task. Only a block that is nothing but
                 # call records counts as a tool_call (M3).
                 remainder = self._prose_remainder(
-                    text, [(start, end) for start, end, _ in tools_with_spans]
+                    text,
+                    self._extend_spans_with_envelopes(
+                        text, [(start, end) for start, end, _ in tools_with_spans]
+                    ),
                 )
                 if re.search(r"[A-Za-z\u4e00-\u9fff]", remainder):
                     kind = "text"

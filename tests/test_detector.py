@@ -1239,6 +1239,91 @@ def test_must_n1_mixed_prose_tool_json():
     print("Must N1 mixed-prose-tool-JSON regression tests passed")
 
 
+def test_must_n2_wrapped_tool_json():
+    """Regression test for N2 (review round 11, 2026-11-13).
+
+    Three pure tool-call JSON records wrapped in an outer envelope
+    (``{"role": "assistant", "tool_calls": [...]}``) must not drift
+    in a Chinese task: stripping only the inner call record left the
+    envelope key names (role/assistant/tool_calls) behind and kind
+    inference mistook them for English prose. The envelope is now
+    stripped together with its calls when it carries no real prose.
+    Controls: an envelope carrying a multi-word English ``note``
+    still drifts, and a spaced-out envelope (``"role": "assistant"``)
+    stays clean.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    rc, data = (lambda p: (p.returncode, json.loads(p.stdout)))(
+        subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+             "--expect-language", "zh", "--text-mode", "instant",
+             "--log", str(ROOT / "fixtures" / "must_n2_wrapped_tool_json.log")],
+            capture_output=True, text=True))
+    assert rc == 0 and data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 3, data
+
+    # API half: the same wrapped records through the detector's kind
+    # inference (event_kind=None, as the CLI feeds stdin blocks).
+    # NOTE: inspect_events({"type": "text", ...}) declares the content
+    # prose, so it deliberately bypasses inference -- a wrapped record
+    # passed as an explicit text event still drifts, exactly as the
+    # N1 API half expects for mixed prose. Inference is exercised
+    # directly on LoopDetector instead.
+    detector = LoopDetector(expected_language="zh", text_mode="instant")
+    for block in (
+        '{"role":"assistant","tool_calls":[{"name":"read","parameters":{"path":"src/alpha/reports/monthly.csv"}}]}',
+        '{"role":"assistant","tool_calls":[{"name":"read","parameters":{"path":"docs/architecture/service-map.md"}}]}',
+        '{"role":"assistant","tool_calls":[{"name":"read","parameters":{"path":"tests/smoke/results/output.json"}}]}',
+    ):
+        detector.process_block(block)
+    assert detector.loop_detected is False, detector.summary()
+
+    # Control: prose mixed with a wrapped call still drifts through
+    # the same inference path (N1 shape, wrapped record).
+    detector = LoopDetector(expected_language="zh", text_mode="instant")
+    for i, first in enumerate(("First", "Second", "Third")):
+        detector.process_block(
+            f"{first} I completed a detailed review of the recent repository changes and found several concrete issues worth discussing. "
+            f'{{"role":"assistant","tool_calls":[{{"name":"read","parameters":{{"path":"file0{i + 1}.txt"}}}}]}}'
+        )
+    assert detector.loop_detected is True, detector.summary()
+    assert detector.summary()["details"]["type"] == "language_drift", detector.summary()
+
+    # Control: an envelope carrying real English prose still drifts.
+    notes = [
+        "Please review this file carefully today",
+        "Please examine the second document thoroughly now",
+        "Please inspect the third output file in detail",
+    ]
+    prose_envelope = "".join(
+        '{"role":"assistant","note":"%s","tool_calls":[{"name":"read","parameters":{"path":"file0%d.txt"}}]}\n\n'
+        % (note, i + 1)
+        for i, note in enumerate(notes)
+    )
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--text-mode", "instant",
+         "--expect-language", "zh"],
+        input=prose_envelope, capture_output=True, text=True)
+    assert p.returncode == 1 and json.loads(p.stdout)["details"]["type"] == "language_drift", (p.stdout, p.stderr)
+
+    # Control: a spaced-out pure envelope stays clean. (Paths differ
+    # substantially, as in the fixture: one-digit differences would
+    # trip Rule 1 similarity instead, which is unrelated to drift.)
+    spaced = "".join(
+        '{"role": "assistant", "tool_calls": [{"name": "read", "parameters": {"path": "%s"}}]}\n\n' % path
+        for path in ("src/alpha/reports/monthly.csv",
+                     "docs/architecture/service-map.md",
+                     "tests/smoke/results/output.json")
+    )
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--text-mode", "instant",
+         "--expect-language", "zh"],
+        input=spaced, capture_output=True, text=True)
+    assert p.returncode == 0 and json.loads(p.stdout)["loop_detected"] is False, (p.stdout, p.stderr)
+    print("Must N2 wrapped-tool-JSON regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -1338,4 +1423,5 @@ if __name__ == "__main__":
     test_must_m7_unbalanced_outer_config_prose()
     test_must_20261112_all_repo_review()
     test_must_n1_mixed_prose_tool_json()
+    test_must_n2_wrapped_tool_json()
     test_detector_behavior_contract()
