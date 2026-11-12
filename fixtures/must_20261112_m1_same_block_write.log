@@ -1,0 +1,4 @@
+--- BLOCK 1 at 2026-01-01T00:00:00+00:00 ---
+{"name": "write", "parameters": {"path": "a.txt", "text": "hello"}}
+{"name": "write", "parameters": {"path": "a.txt", "text": "hello"}}
+{"name": "read", "parameters": {"path": "b.txt"}}

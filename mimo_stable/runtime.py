@@ -47,7 +47,7 @@ def inspect_events(
     )
     for raw in events:
         event = normalize_event(raw)
-        detector.process_block(event.text, event.timestamp)
+        detector.process_block(event.text, event.timestamp, event_kind=event.kind)
         if detector.loop_detected:
             break
     summary = detector.summary()

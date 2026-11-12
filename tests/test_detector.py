@@ -1087,6 +1087,96 @@ def test_must_m7_unbalanced_outer_config_prose():
     print("Must M7 unbalanced-outer-config-prose regression tests passed")
 
 
+def test_must_20261112_all_repo_review():
+    """Regression tests for the 4 new Musts (all-repo review 2026-11-12).
+
+    M1: identical calls already completed mid-block must not be masked by
+    a trailing different call in the same block. M2: the duration gate
+    must measure the whole consecutive-identical run, not the last three
+    blocks. M3: structured tool calls must not count as language drift.
+    M4: an error summary (or a summary without loop_detected) must not
+    be read as "no loop found" by the recovery policy.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+    RECOVERY = ROOT / "scripts" / "recovery_policy.py"
+
+    def cli_fixture(name, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+             *extra_args, "--log", str(ROOT / "fixtures" / name)],
+            capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    def tool(name, arguments):
+        return {"type": "tool_call", "name": name, "arguments": arguments}
+
+    # M1: write,write,read in one block -> repeated side effect; the
+    # trailing read used to mask the completed repeat.
+    rc, data = cli_fixture("must_20261112_m1_same_block_write.log")
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "repeated_side_effect_tool_call", data
+    rc, data = cli_fixture("must_20261112_m1_same_block_read.log")
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "identical_tool_calls", data
+    # API half: the same three calls as one text block.
+    write = json.dumps({"name": "write", "parameters": {"path": "a.txt", "text": "hello"}})
+    read = json.dumps({"name": "read", "parameters": {"path": "b.txt"}})
+    one_block = inspect_events(["\n".join([write, write, read])], text_mode="instant")
+    assert one_block["loop_detected"] is True, one_block
+    assert one_block["details"]["type"] == "repeated_side_effect_tool_call", one_block
+
+    # M2: the same text every 10s for 600s (61 blocks). The fixture run
+    # uses --timeout 60, so the run clears the gate once it reaches 60s.
+    rc, data = cli_fixture("must_20261112_m2_duration_accumulated.log")
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "consecutive_identical_output", data
+    assert data["details"]["duration_seconds"] >= 60, data
+    # API half with the review's exact numbers: default 180s gate, 61
+    # events at 10s spacing must fire once the run reaches 180s.
+    events = [{"type": "text", "text": "The system will now repeat the same status update again and again.",
+               "timestamp": 10.0 * i} for i in range(61)]
+    long_run = inspect_events(events)
+    assert long_run["loop_detected"] is True, long_run
+    assert long_run["details"]["type"] == "consecutive_identical_output", long_run
+    assert long_run["details"]["duration_seconds"] == 180, long_run
+    # ... while a run broken by a different block does not accumulate.
+    broken = events[:10] + [{"type": "text", "text": "A completely different status line appears here instead.",
+                             "timestamp": 100.0}] + [
+        {"type": "text", "text": "The system will now repeat the same status update again and again.",
+         "timestamp": 10.0 * i} for i in range(11, 14)]
+    assert inspect_events(broken)["loop_detected"] is False, broken
+
+    # M3: three reads with Chinese paths under expected_language="zh"
+    # must not drift; the normalized tool record is English-looking JSON
+    # by construction. English prose under zh still drifts.
+    reads = inspect_events(
+        [tool("read", {"path": p}) for p in ("甲", "乙", "丙")],
+        expected_language="zh", text_mode="instant")
+    assert reads["loop_detected"] is False, reads
+    assert reads["policy"]["action"] == "continue", reads
+    prose = inspect_events(["Same English sentence here."] * 3,
+                           expected_language="zh", text_mode="instant")
+    assert prose["loop_detected"] is True, prose
+    assert prose["details"]["type"] == "language_drift", prose
+
+    # M4: an error summary and an empty object are rejected by decide()
+    # and by the recovery CLI (exit 2); a valid summary still decides.
+    for bad in ({"error": "no_input"}, {}):
+        try:
+            decide(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"decide accepted invalid summary: {bad!r}")
+        p = subprocess.run([sys.executable, str(RECOVERY)], input=json.dumps(bad),
+                           capture_output=True, text=True)
+        assert p.returncode == 2, (bad, p.returncode, p.stdout, p.stderr)
+    good = subprocess.run([sys.executable, str(RECOVERY)], input='{"loop_detected": false}',
+                          capture_output=True, text=True)
+    assert good.returncode == 0 and json.loads(good.stdout)["action"] == "continue", good.stdout
+    print("Must 20261112 all-repo-review regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -1184,4 +1274,5 @@ if __name__ == "__main__":
     test_must_m7_tool_shape_in_prose()
     test_must_m7_unbalanced_multiline_prose()
     test_must_m7_unbalanced_outer_config_prose()
+    test_must_20261112_all_repo_review()
     test_detector_behavior_contract()

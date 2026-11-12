@@ -163,6 +163,24 @@ class LoopDetector:
         self.blocks: deque = deque(maxlen=window_size)
         self.tool_calls: deque = deque(maxlen=window_size)
         self.block_timestamps: deque = deque(maxlen=window_size)
+        # Kind of each block, aligned with ``blocks``: "text" for natural
+        # language output, "tool_call" for a structured tool-call record.
+        # The language rule only applies to natural-language output (M3,
+        # 2026-11-12 all-repo review): a tool call's normalized form is
+        # English-looking JSON by construction and must never count as
+        # language-drift evidence.
+        self.block_kinds: deque = deque(maxlen=window_size)
+        # Start of the current run of consecutive identical blocks, for
+        # the duration gate (M2, 2026-11-12 all-repo review): the gate
+        # must measure the whole run, not just the last three blocks.
+        # The run is exact repetition of the same output text. A
+        # similarity test would be wrong here: near-identical tool
+        # records for different files (read file01, file02, ...) are
+        # distinct work, not a repeated output, and must not accumulate
+        # into a duration signal (that case belongs to the opt-in
+        # tool-call budget, not to Rule 1).
+        self._identical_run_base: str | None = None
+        self._identical_run_start: float | None = None
         # Cycle signatures accumulate across result blocks: a real agent loop
         # is call -> result -> call -> result, so clearing on every plain
         # block would make cycles unreachable. Bounded separately.
@@ -536,6 +554,67 @@ class LoopDetector:
             return True
         return False
 
+    def _check_identical_tool_calls(self):
+        """Flag ``repeat_threshold`` consecutive identical tool calls (Rule 2).
+
+        Checked after every call is appended, not only at the end of a
+        block (M1, 2026-11-12 all-repo review): a trailing different call
+        in the same block must not mask a repeat that already completed
+        mid-block. Returns True when a loop was flagged.
+        """
+        if len(self.tool_calls) < self.repeat_threshold:
+            return False
+        recent_tools = list(self.tool_calls)[-self.repeat_threshold:]
+        tool_sigs = [(t["name"], t["params"]) for t in recent_tools]
+        if len(set(tool_sigs)) != 1:
+            return False
+        self.loop_detected = True
+        name, params = tool_sigs[0]
+        self.loop_reason = (
+            f"Detected {len(recent_tools)} consecutive identical "
+            f"tool calls: {name}"
+        )
+        self.loop_details = {
+            "type": "identical_tool_calls",
+            "tool": name,
+            "params_hash": self._params_hash(params),
+            "repeats": len(recent_tools),
+        }
+        self._log(
+            "LOOP_DETECTED",
+            f"{self.loop_reason}\n  Params hash: {self.loop_details['params_hash']}",
+        )
+        return True
+
+    def _check_repeated_side_effect(self):
+        """Flag two identical side-effecting tool calls (Rule 2b).
+
+        Checked after every call is appended, for the same reason as
+        ``_check_identical_tool_calls`` (M1, 2026-11-12 all-repo review):
+        the second identical side-effecting call is already a stop
+        signal, even if a different call follows it in the same block.
+        Returns True when a loop was flagged.
+        """
+        if len(self.tool_calls) < 2:
+            return False
+        previous, current = list(self.tool_calls)[-2:]
+        if not (
+            previous["name"] == current["name"]
+            and previous["params"] == current["params"]
+            and current["name"] in SIDE_EFFECT_TOOLS
+        ):
+            return False
+        self.loop_detected = True
+        self.loop_reason = f"Detected repeated side-effecting tool call: {current['name']}"
+        self.loop_details = {
+            "type": "repeated_side_effect_tool_call",
+            "tool": current["name"],
+            "params_hash": self._params_hash(current["params"]),
+            "repeats": 2,
+        }
+        self._log("LOOP_DETECTED", self.loop_reason)
+        return True
+
     def _repeated_ngram_evidence(self, text: str) -> dict | None:
         """Detect repetition inside one long block.
 
@@ -584,12 +663,16 @@ class LoopDetector:
             return
         print(f"[{timestamp}] [{level}] {message}", flush=True)
 
-    def process_block(self, text: str, block_time: float | None = None):
+    def process_block(self, text: str, block_time: float | None = None, event_kind: str | None = None):
         """Process a single output block from the model.
 
         Args:
             text: The model output text for this block
             block_time: Timestamp when this block was emitted (unix epoch)
+            event_kind: "text" for natural-language output, "tool_call"
+                for a structured tool-call record. When None the kind is
+                inferred from the tool calls extracted from the block.
+                The language rule only applies to "text" blocks (M3).
         """
         if block_time is None:
             block_time = time.time()
@@ -601,10 +684,29 @@ class LoopDetector:
         self.blocks.append(text)
         self.block_timestamps.append(block_time)
 
+        # Track the run of consecutive identical blocks: the duration gate
+        # (Rule 1) measures this run, not the last three blocks (M2,
+        # 2026-11-12 all-repo review). A run that has been repeating the
+        # same text for ten minutes must clear a three-minute gate even
+        # though any three consecutive blocks span only twenty seconds.
+        # Exact repetition only: a block that merely resembles the run
+        # base (different file, one word changed) starts a new run, so
+        # distinct work never accumulates into a duration signal.
+        if text != self._identical_run_base:
+            self._identical_run_base = text
+            self._identical_run_start = block_time
+
         # Tool calls must be consecutive output events. A normal model/result
         # block between calls is evidence of progress, so do not carry an old
         # call across it when evaluating a call-loop.
         tools = self._extract_tool_calls(text)
+        if event_kind is None:
+            kind = "tool_call" if tools else "text"
+        elif event_kind in ("text", "tool_call"):
+            kind = event_kind
+        else:
+            raise ValueError("event_kind must be 'text' or 'tool_call'")
+        self.block_kinds.append(kind)
         if not tools:
             self.tool_calls.clear()
         for t in tools:
@@ -617,6 +719,14 @@ class LoopDetector:
             # calls in the same block must not mask it.
             if not self.loop_detected:
                 self._check_tool_cycle()
+            # Same per-call rule for identical calls and repeated side
+            # effects (M1, 2026-11-12 all-repo review): a repeat that
+            # already completed mid-block is a signal worth keeping, even
+            # if a different call follows it in the same block.
+            if not self.loop_detected:
+                self._check_identical_tool_calls()
+            if not self.loop_detected:
+                self._check_repeated_side_effect()
         self.total_tool_calls += len(tools)
 
         # A configured Chinese task that repeatedly produces English-only
@@ -624,7 +734,14 @@ class LoopDetector:
         # cannot be inferred safely from an arbitrary log.
         if self.expected_language == "zh" and len(self.blocks) >= self.repeat_threshold:
             recent_blocks = list(self.blocks)[-self.repeat_threshold:]
-            if all(self._looks_english(block) for block in recent_blocks):
+            recent_kinds = list(self.block_kinds)[-self.repeat_threshold:]
+            # Only natural-language output counts (M3, 2026-11-12 all-repo
+            # review): a structured tool-call record is English-looking
+            # JSON by construction -- its arguments are replaced by a
+            # fingerprint -- so it must never count as drift evidence.
+            if all(kind == "text" for kind in recent_kinds) and all(
+                self._looks_english(block) for block in recent_blocks
+            ):
                 self.loop_detected = True
                 self.loop_reason = "Detected repeated English-only output in a Chinese task"
                 self.loop_details = {
@@ -636,7 +753,12 @@ class LoopDetector:
                 return
 
         # --- Rule 1: Consecutive identical output blocks ---
-        if len(self.blocks) >= self.repeat_threshold:
+        # Guarded like Rules 4-5: a signal already raised earlier in this
+        # block (e.g. identical tool calls, checked per call) is kept,
+        # not overwritten by a later rule (M1, 2026-11-12 all-repo review).
+        # Before the per-call move, the end-of-block Rule 2 ran after
+        # Rule 1 and overwrote its verdict; the first signal now wins.
+        if not self.loop_detected and len(self.blocks) >= self.repeat_threshold:
             recent = list(self.blocks)[-self.repeat_threshold:]
             # Check if all recent blocks are identical or highly similar
             base = recent[0]
@@ -646,7 +768,12 @@ class LoopDetector:
             )
 
             if identical:
-                duration = block_time - self.block_timestamps[-self.repeat_threshold]
+                # Duration of the whole consecutive-identical run (M2,
+                # 2026-11-12 all-repo review), not just the last three
+                # blocks: with ten-second spacing the last three blocks
+                # always span twenty seconds and can never reach a
+                # three-minute gate, however long the run has lasted.
+                duration = block_time - self._identical_run_start
                 # Also check duration threshold (default 3 min)
                 if self.text_mode == "instant" or duration >= self.time_threshold:
                     self.loop_detected = True
@@ -666,47 +793,6 @@ class LoopDetector:
                         "LOOP_DETECTED",
                         f"{self.loop_reason}\n  Text hash: {self.loop_details['evidence']['text_hash']}",
                     )
-
-        # --- Rule 2: Same tool called 3+ times with identical params ---
-        if len(self.tool_calls) >= self.repeat_threshold:
-            recent_tools = list(self.tool_calls)[-self.repeat_threshold:]
-            tool_sigs = [(t["name"], t["params"]) for t in recent_tools]
-            if len(set(tool_sigs)) == 1:
-                self.loop_detected = True
-                name, params = tool_sigs[0]
-                self.loop_reason = (
-                    f"Detected {len(recent_tools)} consecutive identical "
-                    f"tool calls: {name}"
-                )
-                self.loop_details = {
-                    "type": "identical_tool_calls",
-                    "tool": name,
-                    "params_hash": self._params_hash(params),
-                    "repeats": len(recent_tools),
-                }
-                self._log(
-                    "LOOP_DETECTED",
-                    f"{self.loop_reason}\n  Params hash: {self.loop_details['params_hash']}",
-                )
-
-        # External side effects must not be retried blindly. Two identical
-        # attempts are enough to stop and require a fresh safety review.
-        if len(self.tool_calls) >= 2:
-            previous, current = list(self.tool_calls)[-2:]
-            if (
-                previous["name"] == current["name"]
-                and previous["params"] == current["params"]
-                and current["name"] in SIDE_EFFECT_TOOLS
-            ):
-                self.loop_detected = True
-                self.loop_reason = f"Detected repeated side-effecting tool call: {current['name']}"
-                self.loop_details = {
-                    "type": "repeated_side_effect_tool_call",
-                    "tool": current["name"],
-                    "params_hash": self._params_hash(current["params"]),
-                    "repeats": 2,
-                }
-                self._log("LOOP_DETECTED", self.loop_reason)
 
         # --- Rule 3: Tool-call cycle (A-B-A-B) ---
         if not self.loop_detected:
@@ -747,6 +833,9 @@ class LoopDetector:
         self.blocks.clear()
         self.tool_calls.clear()
         self.block_timestamps.clear()
+        self.block_kinds.clear()
+        self._identical_run_base = None
+        self._identical_run_start = None
         self.cycle_signatures.clear()
         self.total_tool_calls = 0
         self.loop_detected = False
