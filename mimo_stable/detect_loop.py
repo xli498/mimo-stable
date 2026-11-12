@@ -170,6 +170,12 @@ class LoopDetector:
         # English-looking JSON by construction and must never count as
         # language-drift evidence.
         self.block_kinds: deque = deque(maxlen=window_size)
+        # Natural-language text of each block, aligned with ``blocks``:
+        # the full text for plain/API text blocks, the prose left after
+        # stripping tool-call records for mixed blocks, "" for pure
+        # tool-call records. The language rule judges this text (N1,
+        # 2026-11-13), so English inside tool parameters never counts.
+        self.block_language_texts: deque = deque(maxlen=window_size)
         # Start of the current run of consecutive identical blocks, for
         # the duration gate (M2, 2026-11-12 all-repo review): the gate
         # must measure the whole run, not just the last three blocks.
@@ -265,8 +271,13 @@ class LoopDetector:
         """
         return text[end:].split("\n", 1)[0].strip() == ""
 
-    def _extract_tool_calls(self, text: str) -> list[dict]:
+    def _extract_tool_calls_with_spans(self, text: str) -> list[tuple[int, int, dict]]:
         """Extract tool call signatures from model output text.
+
+        Returns ``(start, end, call)`` triples in text order, where
+        ``(start, end)`` is the span of the call record. The spans let
+        kind inference strip call records before judging the remaining
+        prose (N1, 2026-11-13).
 
         Handles common formats:
         - JSON tool_call blocks
@@ -512,7 +523,33 @@ class LoopDetector:
                 continue
             kept.append(candidate)
         kept.sort(key=lambda item: item[0])
-        return [call for _, _, call in kept]
+        return kept
+
+    def _extract_tool_calls(self, text: str) -> list[dict]:
+        """Extract tool call signatures from model output text.
+
+        Thin wrapper over :meth:`_extract_tool_calls_with_spans` that
+        drops the record spans; this is the shape callers assert on.
+        """
+        return [call for _, _, call in self._extract_tool_calls_with_spans(text)]
+
+    @staticmethod
+    def _prose_remainder(text: str, spans: list[tuple[int, int]]) -> str:
+        """Return ``text`` with the given (start, end) spans removed.
+
+        Used for kind inference (N1, 2026-11-13): a block that mixes
+        natural-language prose with tool-call records keeps its prose
+        once the records are stripped, so the language rule can judge
+        the prose alone. Spans must be sorted and non-overlapping, as
+        produced by :meth:`_extract_tool_calls_with_spans`.
+        """
+        parts: list[str] = []
+        pos = 0
+        for start, end in spans:
+            parts.append(text[pos:start])
+            pos = max(pos, end)
+        parts.append(text[pos:])
+        return "".join(parts).strip()
 
     def _check_tool_cycle(self):
         """Detect a repeating tool-call cycle (A-B-A-B, up to 4-step patterns).
@@ -671,8 +708,10 @@ class LoopDetector:
             block_time: Timestamp when this block was emitted (unix epoch)
             event_kind: "text" for natural-language output, "tool_call"
                 for a structured tool-call record. When None the kind is
-                inferred from the tool calls extracted from the block.
-                The language rule only applies to "text" blocks (M3).
+                inferred from the tool calls extracted from the block: a
+                block that still has prose after its call records are
+                stripped counts as "text" (N1). The language rule only
+                applies to "text" blocks (M3).
         """
         if block_time is None:
             block_time = time.time()
@@ -699,14 +738,36 @@ class LoopDetector:
         # Tool calls must be consecutive output events. A normal model/result
         # block between calls is evidence of progress, so do not carry an old
         # call across it when evaluating a call-loop.
-        tools = self._extract_tool_calls(text)
+        tools_with_spans = self._extract_tool_calls_with_spans(text)
+        tools = [call for _, _, call in tools_with_spans]
         if event_kind is None:
-            kind = "tool_call" if tools else "text"
+            if not tools:
+                kind = "text"
+                language_text = text
+            else:
+                # A block that mixes prose with tool-call records is
+                # natural-language output for the language rule as long
+                # as prose remains once the records are stripped (N1,
+                # 2026-11-13): an English explanation followed by a
+                # ``read`` JSON record is still English output drifting
+                # from a Chinese task. Only a block that is nothing but
+                # call records counts as a tool_call (M3).
+                remainder = self._prose_remainder(
+                    text, [(start, end) for start, end, _ in tools_with_spans]
+                )
+                if re.search(r"[A-Za-z\u4e00-\u9fff]", remainder):
+                    kind = "text"
+                    language_text = remainder
+                else:
+                    kind = "tool_call"
+                    language_text = ""
         elif event_kind in ("text", "tool_call"):
             kind = event_kind
+            language_text = text if kind == "text" else ""
         else:
             raise ValueError("event_kind must be 'text' or 'tool_call'")
         self.block_kinds.append(kind)
+        self.block_language_texts.append(language_text)
         if not tools:
             self.tool_calls.clear()
         for t in tools:
@@ -733,21 +794,25 @@ class LoopDetector:
         # output is an actionable drift signal. It is opt-in because language
         # cannot be inferred safely from an arbitrary log.
         if self.expected_language == "zh" and len(self.blocks) >= self.repeat_threshold:
-            recent_blocks = list(self.blocks)[-self.repeat_threshold:]
             recent_kinds = list(self.block_kinds)[-self.repeat_threshold:]
+            recent_texts = list(self.block_language_texts)[-self.repeat_threshold:]
             # Only natural-language output counts (M3, 2026-11-12 all-repo
             # review): a structured tool-call record is English-looking
             # JSON by construction -- its arguments are replaced by a
             # fingerprint -- so it must never count as drift evidence.
+            # The check runs on the prose left after stripping call
+            # records (N1, 2026-11-13), never on the records
+            # themselves: English words inside tool parameters are not
+            # assistant prose and must not tip the heuristic.
             if all(kind == "text" for kind in recent_kinds) and all(
-                self._looks_english(block) for block in recent_blocks
+                self._looks_english(language_text) for language_text in recent_texts
             ):
                 self.loop_detected = True
                 self.loop_reason = "Detected repeated English-only output in a Chinese task"
                 self.loop_details = {
                     "type": "language_drift",
                     "expected_language": "zh",
-                    "repeats": len(recent_blocks),
+                    "repeats": len(recent_texts),
                 }
                 self._log("LOOP_DETECTED", self.loop_reason)
                 return
@@ -834,6 +899,7 @@ class LoopDetector:
         self.tool_calls.clear()
         self.block_timestamps.clear()
         self.block_kinds.clear()
+        self.block_language_texts.clear()
         self._identical_run_base = None
         self._identical_run_start = None
         self.cycle_signatures.clear()

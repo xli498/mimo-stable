@@ -1177,6 +1177,68 @@ def test_must_20261112_all_repo_review():
     print("Must 20261112 all-repo-review regression tests passed")
 
 
+def test_must_n1_mixed_prose_tool_json():
+    """Regression test for N1 (review round 10, 2026-11-13).
+
+    A block that mixes English prose with a tool-call JSON record is
+    still English natural-language output: with expected_language="zh"
+    it must drift. The M3 fix had classified any block containing a
+    tool call as a tool_call, so the drift check never saw the prose.
+    Controls: Chinese prose mixed with a tool record must not drift,
+    and a one-word English marker ("Done.") plus a tool record must
+    not drift either -- the language check judges the prose that
+    remains after stripping the call records, not the records.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_fixture(name, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+             *extra_args, "--log", str(ROOT / "fixtures" / name)],
+            capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    rc, data = cli_fixture("must_n1_mixed_prose_tool_json.log",
+                           ("--expect-language", "zh", "--text-mode", "instant"))
+    assert rc == 1 and data["loop_detected"] is True, data
+    assert data["details"]["type"] == "language_drift", data
+
+    # API half: the same mixed content as explicit text events drifts.
+    base = "First I completed a detailed review of the recent repository changes and found several concrete issues worth discussing. "
+    events = [
+        {"type": "text", "text": base + '{"name":"read","parameters":{"path":"file01.txt"}}'},
+        {"type": "text", "text": base.replace("First", "Second") + '{"name":"read","parameters":{"path":"file02.txt"}}'},
+        {"type": "text", "text": base.replace("First", "Third") + '{"name":"read","parameters":{"path":"file03.txt"}}'},
+    ]
+    r = inspect_events(events, expected_language="zh", text_mode="instant")
+    assert r["loop_detected"] is True, r
+    assert r["details"]["type"] == "language_drift", r
+
+    # Control: Chinese prose mixed with a tool record must not drift.
+    zh = inspect_events(
+        [{"type": "text", "text": "我已完成检查。{\"name\":\"read\",\"parameters\":{\"path\":\"file01.txt\"}}"},
+         {"type": "text", "text": "我已核对输出。{\"name\":\"read\",\"parameters\":{\"path\":\"file02.txt\"}}"},
+         {"type": "text", "text": "我已确认结果。{\"name\":\"read\",\"parameters\":{\"path\":\"file03.txt\"}}"}],
+        expected_language="zh", text_mode="instant")
+    assert zh["loop_detected"] is False, zh
+
+    # Control: a one-word English marker plus a tool record is not
+    # enough prose to judge language drift (CLI path: the marker is
+    # the whole prose remainder once the record is stripped). The
+    # markers differ so Rule 1 similarity does not fire first.
+    marker = (
+        "Done. {\"name\":\"read\",\"parameters\":{\"path\":\"file01.txt\"}}\n\n"
+        "Checked. {\"name\":\"read\",\"parameters\":{\"path\":\"file02.txt\"}}\n\n"
+        "Verified. {\"name\":\"read\",\"parameters\":{\"path\":\"file03.txt\"}}\n"
+    )
+    p = subprocess.run(
+        [sys.executable, str(DETECTOR), "--json", "--text-mode", "instant",
+         "--expect-language", "zh"],
+        input=marker, capture_output=True, text=True)
+    assert p.returncode == 0 and json.loads(p.stdout)["loop_detected"] is False, (p.stdout, p.stderr)
+    print("Must N1 mixed-prose-tool-JSON regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -1275,4 +1337,5 @@ if __name__ == "__main__":
     test_must_m7_unbalanced_multiline_prose()
     test_must_m7_unbalanced_outer_config_prose()
     test_must_20261112_all_repo_review()
+    test_must_n1_mixed_prose_tool_json()
     test_detector_behavior_contract()
