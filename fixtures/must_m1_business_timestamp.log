@@ -1,0 +1,4 @@
+--- BLOCK 1 at 2026-01-01T00:00:00+00:00 ---
+{"name": "write", "parameters": {"path": "audit.json", "content": [{"timestamp": 100, "value": 42}]}}
+--- BLOCK 2 at 2026-01-01T00:00:10+00:00 ---
+{"name": "write", "parameters": {"path": "audit.json", "content": [{"timestamp": 101, "value": 42}]}}

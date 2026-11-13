@@ -8,7 +8,12 @@ repeatedly emits identical or near-identical text blocks.
 Detection rules:
   1. Consecutive identical output blocks (3+ repeats)
   2. Same tool called 3+ times with identical parameters
+     (top-level volatile keys such as request_id are ignored;
+      the same key nested inside a business payload is kept)
   3. Output duration exceeding threshold without meaningful change
+  4. Tool-call cycles (a 2-4 step pattern repeating twice)
+  5. Repeated n-grams inside a single long block
+  6. Optional tool-call budget ceiling (opt-in only)
 
 Usage:
   # From stdin (pipe model output):
@@ -50,6 +55,66 @@ SIDE_EFFECT_TOOLS = {
     "purchase", "post", "publish", "create", "submit",
 }
 
+# Keys that carry per-attempt metadata rather than the intent of a call.
+# Two calls that differ only in these keys are the same call. Stripping them
+# keeps a loop from hiding behind regenerated request ids or timestamps.
+# Deliberately narrow in two ways: keys such as "id", "offset" or "path"
+# stay, because they can change what the call does; and stripping applies
+# only to the top level of the arguments object, because a field of the same
+# name nested inside a business payload (for example a "timestamp" inside a
+# list of records being written) is business content, not call metadata.
+# Callers that carry metadata in a nested object must hoist it to the top
+# level for it to be ignored.
+VOLATILE_PARAM_KEYS = {
+    "request_id", "trace_id", "created_at", "timestamp", "nonce",
+}
+
+# A repeating read/write pattern (read -> edit -> read -> edit) is normal
+# repair work, not a loop. A cycle is only a signal when it does not mix
+# both sides. The sets are intentionally small; unknown tools count as
+# neither, so an unknown-tool cycle still triggers.
+READ_TOOLS = {
+    "read", "browser", "web_fetch", "grep", "find", "search",
+    "list", "cat", "glob", "view",
+}
+WRITE_TOOLS = {
+    "write", "edit", "create", "delete", "remove", "send", "post",
+    "publish", "submit", "exec", "apply_patch", "move", "rename",
+    "update", "insert",
+}
+
+# Cycle detection: pattern lengths to look for, and how many complete
+# repetitions of the pattern count as a loop. Two full cycles matches the
+# published behavior of comparable guards without waiting for a long stall.
+CYCLE_PERIODS = (2, 3, 4)
+CYCLE_REPEATS = 2
+
+# Within-block n-gram repetition: a single long block whose own phrases
+# repeat. Both bars must clear, so boilerplate in a long answer does not
+# trigger on a few repeated lines.
+NGRAM_WORDS = 5
+NGRAM_MIN_WORDS = 50
+NGRAM_MIN_OCCURRENCES = 5
+NGRAM_MIN_COVERAGE = 0.5
+
+
+def strip_volatile_params(params):
+    """Return a copy of tool parameters without top-level volatile keys.
+
+    Only the top level of the arguments object is denoised: that is where
+    per-attempt call metadata lives. Nested values are business payload and
+    are preserved verbatim, so two writes that differ only in a timestamp
+    inside the content being written stay different calls (M1). Non-dict
+    inputs are returned unchanged.
+    """
+    if isinstance(params, dict):
+        return {
+            key: value
+            for key, value in params.items()
+            if key not in VOLATILE_PARAM_KEYS
+        }
+    return params
+
 
 class LoopDetector:
     """Detects degenerate loops in model output streams."""
@@ -62,6 +127,7 @@ class LoopDetector:
         text_mode: str = "duration",
         json_output: bool = False,
         expected_language: str | None = None,
+        max_tool_calls: int | None = None,
     ):
         if not isinstance(repeat_threshold, int) or isinstance(repeat_threshold, bool) or repeat_threshold < 2:
             raise ValueError("repeat_threshold must be at least 2")
@@ -78,18 +144,54 @@ class LoopDetector:
             raise ValueError("text_mode must be 'duration' or 'instant'")
         if expected_language not in {None, "zh"}:
             raise ValueError("expected_language must be None or 'zh'")
+        if max_tool_calls is not None and (
+            not isinstance(max_tool_calls, int)
+            or isinstance(max_tool_calls, bool)
+            or max_tool_calls < 1
+        ):
+            raise ValueError("max_tool_calls must be None or a positive integer")
         self.repeat_threshold = repeat_threshold
         self.time_threshold = time_threshold
         self.similarity_threshold = similarity_threshold
         self.text_mode = text_mode
         self.json_output = json_output
         self.expected_language = expected_language
+        self.max_tool_calls = max_tool_calls
 
         # State
         window_size = max(repeat_threshold + 5, 20)
         self.blocks: deque = deque(maxlen=window_size)
         self.tool_calls: deque = deque(maxlen=window_size)
         self.block_timestamps: deque = deque(maxlen=window_size)
+        # Kind of each block, aligned with ``blocks``: "text" for natural
+        # language output, "tool_call" for a structured tool-call record.
+        # The language rule only applies to natural-language output (M3,
+        # 2026-11-12 all-repo review): a tool call's normalized form is
+        # English-looking JSON by construction and must never count as
+        # language-drift evidence.
+        self.block_kinds: deque = deque(maxlen=window_size)
+        # Natural-language text of each block, aligned with ``blocks``:
+        # the full text for plain/API text blocks, the prose left after
+        # stripping tool-call records for mixed blocks, "" for pure
+        # tool-call records. The language rule judges this text (N1,
+        # 2026-11-13), so English inside tool parameters never counts.
+        self.block_language_texts: deque = deque(maxlen=window_size)
+        # Start of the current run of consecutive identical blocks, for
+        # the duration gate (M2, 2026-11-12 all-repo review): the gate
+        # must measure the whole run, not just the last three blocks.
+        # The run is exact repetition of the same output text. A
+        # similarity test would be wrong here: near-identical tool
+        # records for different files (read file01, file02, ...) are
+        # distinct work, not a repeated output, and must not accumulate
+        # into a duration signal (that case belongs to the opt-in
+        # tool-call budget, not to Rule 1).
+        self._identical_run_base: str | None = None
+        self._identical_run_start: float | None = None
+        # Cycle signatures accumulate across result blocks: a real agent loop
+        # is call -> result -> call -> result, so clearing on every plain
+        # block would make cycles unreachable. Bounded separately.
+        self.cycle_signatures: deque = deque(maxlen=24)
+        self.total_tool_calls = 0
         self.loop_detected = False
         self.loop_reason = ""
         self.loop_details: dict = {}
@@ -118,45 +220,642 @@ class LoopDetector:
         cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
         return latin >= 10 and cjk == 0
 
-    def _extract_tool_calls(self, text: str) -> list[dict]:
+    @staticmethod
+    def _scan_balanced_parens(text: str, open_index: int) -> tuple[str, int] | None:
+        """Return (arguments, end) for the call opening at ``open_index``.
+
+        Scans for the parenthesis matching the ``(`` at ``open_index``,
+        ignoring parentheses inside single- or double-quoted strings and
+        honouring backslash escapes inside them, so a ``)`` in a JSON
+        string value (or an escaped quote just before one) does not end
+        the arguments early (M5 boundary). Nested parentheses outside
+        strings are counted. Returns ``None`` when the parentheses never
+        balance: an unparseable prefix must never be used as a call
+        signature. ``end`` is the index just past the closing ``)``.
+        """
+        depth = 0
+        quote: str | None = None
+        index = open_index
+        while index < len(text):
+            char = text[index]
+            if quote is not None:
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[open_index + 1:index], index + 1
+            index += 1
+        return None
+
+    @staticmethod
+    def _ends_call_record(text: str, end: int) -> bool:
+        """Return True when ``end`` (just past ``)``) ends a call record.
+
+        A complete function-style call record occupies its line: only
+        whitespace may follow the closing parenthesis before the end of
+        the line (or of the text). Anything else on the same line -- a
+        word, punctuation, another token -- means the line-start name
+        is prose mentioning the tool (e.g. ``write() denotes ...``),
+        not a call. Prose on a *later* line does not affect the call:
+        only the remainder of the call's own line is examined.
+        """
+        return text[end:].split("\n", 1)[0].strip() == ""
+
+    def _extract_tool_calls_with_spans(self, text: str) -> list[tuple[int, int, dict]]:
         """Extract tool call signatures from model output text.
+
+        Returns ``(start, end, call)`` triples in text order, where
+        ``(start, end)`` is the span of the call record. The spans let
+        kind inference strip call records before judging the remaining
+        prose (N1, 2026-11-13).
 
         Handles common formats:
         - JSON tool_call blocks
         - Function call patterns
         - Tool use markers
+
+        One JSON object is one call record: once an object is identified as
+        a tool call, scanning resumes after it, so a nested example inside
+        its parameters is never counted as a second call (M3). A JSON object
+        that is not itself a call record is still scanned inside, so a call
+        wrapped in another object is found. Function-style calls may start
+        on any line, so several calls in one block are all counted (M3).
+        When a function-style argument parses as a JSON object it is
+        normalized exactly like a JSON record (keys sorted, top-level
+        volatile keys ignored); any other argument syntax is compared
+        verbatim (M5). A zero-argument call (``browser()``) counts with
+        params ``"{}"``, the same normalized form the structured API
+        produces for ``arguments: {}``, so CLI and API agree on the
+        tool-call budget -- but only when the closing ``)`` ends the
+        call record: only whitespace may follow it on the same line.
+        A line-start name followed by prose on the same line (e.g.
+        ``write() denotes the writer interface ...`` or
+        ``write({"path": ...}) denotes ...``) is ordinary
+        documentation mentioning the tool, not a call, and is not
+        counted (line-start prose Must, PR #3 re-review 3 for
+        zero-argument calls, re-review 4 for calls with arguments):
+        the closing ``)`` must end the call record in both branches,
+        i.e. only whitespace may follow it on the same line. The prose
+        exclusion also covers a tool-shaped JSON object nested inside
+        the excluded mention's arguments (e.g. the ``send`` inside
+        ``write({"name": "send", ...}) denotes ...``): the JSON scan
+        runs first and would otherwise leave that inner candidate
+        standing after the outer mention is dropped (M7, PR #3
+        re-review 6). The same holds when the parentheses never
+        balance and the nested JSON spans several lines: the
+        exclusion span stretches to cover a JSON candidate that
+        starts on the mention's line, instead of stopping at that
+        line's end (M7 unbalanced variant, PR #3 re-review 7).
+        It also holds when the argument opens with an ordinary
+        (non-tool-shaped) config JSON object and the tool-shaped
+        object is nested inside it on a later line: the span
+        stretches to the end of that outer object, so the inner
+        candidate falls inside it (M7 outer-config variant, PR #3
+        re-review 8).
+        The closing parenthesis is found by a quote-aware
+        scan, so a ")" inside a quoted string (or an escaped quote just
+        before one) does not end the arguments early (M5 boundary); a call
+        whose parentheses never balance is not counted at all, because an
+        unparseable argument prefix must never be used as a call signature.
+        When a JSON record and a function-style call overlap
+        in the text, only the outer construct is kept, so the same call is
+        never counted twice.
         """
-        calls = []
+        candidates: list[tuple[int, int, dict]] = []
 
         # Parse JSON objects rather than matching braces. Tool parameters may
         # legitimately contain nested objects, arrays, or escaped strings.
+        # Every successfully decoded JSON object is also recorded in
+        # ``json_spans`` (tool-shaped or not): the prose-exclusion logic
+        # below needs the span of an outer config object that merely
+        # *contains* a tool-shaped object (M7 outer-config variant,
+        # PR #3 re-review 8).
         decoder = json.JSONDecoder()
-        for match in re.finditer(r'\{', text):
+        json_spans: list[tuple[int, int]] = []
+        pos = 0
+        while True:
+            brace = re.search(r"\{", text[pos:])
+            if brace is None:
+                break
+            start = pos + brace.start()
             try:
-                candidate, _ = decoder.raw_decode(text[match.start():])
+                candidate, end = decoder.raw_decode(text[start:])
             except (json.JSONDecodeError, ValueError):
-                pass
-            else:
-                if (
-                    isinstance(candidate, dict)
-                    and isinstance(candidate.get("name"), str)
-                    and isinstance(candidate.get("parameters"), dict)
-                ):
-                    calls.append({
+                pos = start + 1
+                continue
+            json_spans.append((start, start + end))
+            if (
+                isinstance(candidate, dict)
+                and isinstance(candidate.get("name"), str)
+                and isinstance(candidate.get("parameters"), dict)
+            ):
+                params = strip_volatile_params(candidate["parameters"])
+                candidates.append((
+                    start,
+                    start + end,
+                    {
                         "name": candidate["name"],
-                        "params": json.dumps(candidate["parameters"], sort_keys=True),
-                    })
+                        "params": json.dumps(params, sort_keys=True),
+                    },
+                ))
+                pos = start + end
+            else:
+                pos = start + 1
 
         # Function-style calls must begin a line. This avoids treating normal
         # prose such as "I will edit (the draft)" as an actual tool invocation.
-        func_pattern = r'^\s*(read|write|exec|edit|browser|web_fetch)\s*\(([^)]*)\)'
-        for match in re.finditer(func_pattern, text, re.IGNORECASE):
-            tool = match.group(1).lower()
-            args = match.group(2).strip()
-            if args:
-                calls.append({"name": tool, "params": args})
+        # The arguments are not captured with a regex: the closing parenthesis
+        # is found by a quote-aware scan, so a ")" inside a quoted string
+        # does not truncate the arguments (M5 boundary).
+        func_header = re.compile(
+            r"^\s*(read|write|exec|edit|browser|web_fetch)\s*\(",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        # Spans of line-start function-style mentions that the
+        # complete-call-record check rejected as prose (M7): a prose
+        # mention's arguments may themselves contain a tool-shaped JSON
+        # object (e.g. ``write({"name": "send", ...}) denotes ...``),
+        # which the JSON scan above already recorded as a candidate for
+        # the inner ``send``. The prose exclusion must cover those inner
+        # candidates too, or the outer exclusion is undone by the inner
+        # one surviving the overlap dedup below.
+        excluded_spans: list[tuple[int, int]] = []
+        for header in func_header.finditer(text):
+            tool = header.group(1).lower()
+            scanned = self._scan_balanced_parens(text, header.end() - 1)
+            if scanned is None:
+                # Parentheses never balance: there is no complete call
+                # here, so the line-start mention is prose; exclude any
+                # tool-shaped JSON candidate on the same line (up to the
+                # end of the header's line only, so later lines are
+                # unaffected). A tool-shaped JSON candidate that *starts*
+                # on the header's line may itself span several lines
+                # (e.g. ``write({\n "name": "send", ...\n}`` with no
+                # closing paren): the span must stretch to cover that
+                # whole candidate, or the fully-inside filter below
+                # keeps it and the prose mention is undone by its inner
+                # ``send`` (M7 unbalanced variant, PR #3 re-review 7).
+                # Only candidates starting inside the span extend it;
+                # a candidate starting on a later line (e.g. a real
+                # call after the prose) is untouched, and a candidate
+                # that merely overlaps from before the header is not
+                # swallowed either. The header's line is measured from
+                # the tool name, not from the match start: the leading
+                # ``\s*`` in the header pattern can swallow the
+                # preceding newline, which would otherwise make the
+                # line end the previous (blank) line and miss a
+                # candidate starting on the header's own line.
+                name_start = header.start(1)
+                line_end = text.find("\n", name_start)
+                span_end = len(text) if line_end == -1 else line_end
+                # M7 outer-config variant (PR #3 re-review 8): the
+                # argument may open with an ordinary config JSON object
+                # (e.g. ``write({"path": "config.json", "content":
+                # {"name": "send", ...}}`` with no closing paren). That
+                # outer object is not tool-shaped, so it never enters
+                # ``candidates``, and the inner ``send`` candidate starts
+                # on a later line -- outside the header's line, so the
+                # candidate-extension loop below never reaches it. When
+                # only whitespace lies between the ``(`` and the opening
+                # ``{`` of such an object (same line, or the ``{`` moved
+                # to the next line), the argument *is* that object:
+                # stretch the span to the end of it, so the nested
+                # candidate falls inside the span and the fully-inside
+                # filter drops it. The whitespace-only guard keeps a
+                # real call on a later line out of the span: anything
+                # after the outer object ends is untouched, and a
+                # non-JSON argument cannot drag a distant ``{`` into
+                # the span. The candidate-extension loop then runs over
+                # the stretched span as before.
+                open_paren = header.end() - 1
+                for obj_start, obj_end in json_spans:
+                    if obj_start >= open_paren and text[
+                        open_paren + 1:obj_start
+                    ].strip() == "":
+                        span_end = max(span_end, obj_end)
+                        break
+                for cand_start, cand_end, _ in candidates:
+                    if header.start() <= cand_start < span_end:
+                        span_end = max(span_end, cand_end)
+                excluded_spans.append((header.start(), span_end))
+                continue
+            args, end = scanned
+            args = args.strip()
+            if not args:
+                # Zero-argument call (e.g. ``browser()``): count it, with
+                # params normalized to "{}" exactly as the structured API
+                # normalizes ``arguments: {}``. Dropping it here made the
+                # CLI silently disagree with the API on the tool-call
+                # budget (empty-args Must, PR #3 re-review 2). But the
+                # call must end its line: a line-start name followed by
+                # prose on the same line (``write() denotes ...``) is
+                # documentation mentioning the tool, not a call, and is
+                # skipped (line-start prose Must, PR #3 re-review 3).
+                if not self._ends_call_record(text, end):
+                    excluded_spans.append((header.start(), end))
+                    continue
+                candidates.append((header.start(), end, {
+                    "name": tool, "params": "{}",
+                }))
+                continue
+            params: str = args
+            try:
+                parsed = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                params = json.dumps(
+                    strip_volatile_params(parsed), sort_keys=True
+                )
+            # Same complete-call-record boundary as the zero-argument
+            # branch: the closing ")" must end the call's line (only
+            # whitespace may follow it). A line-start name with
+            # arguments followed by prose on the same line (e.g.
+            # ``write({"path": ...}) denotes ...``) is documentation
+            # mentioning the tool, not a call, and is skipped
+            # (line-start prose Must, PR #3 re-review 4). Prose on a
+            # later line does not affect the call.
+            if not self._ends_call_record(text, end):
+                excluded_spans.append((header.start(), end))
+                continue
+            candidates.append((header.start(), end, {
+                "name": tool, "params": params,
+            }))
 
-        return calls
+        # Drop any candidate fully inside a prose-excluded function-style
+        # span (M7). The JSON scan runs before the function-style prose
+        # check, so without this the inner tool-shaped JSON of a prose
+        # mention (e.g. the ``send`` inside
+        # ``write({"name": "send", ...}) denotes ...``) would survive
+        # even though the outer mention was correctly excluded. A real
+        # standalone call passes the record check and is never in an
+        # excluded span, so it is unaffected; the overlap dedup below
+        # still drops inner candidates of a kept outer call.
+        if excluded_spans:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if not any(
+                    candidate[0] >= start and candidate[1] <= end
+                    for start, end in excluded_spans
+                )
+            ]
+
+        # Keep candidates in text order, dropping any candidate strictly
+        # inside one that starts earlier (the outer construct wins).
+        candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+        kept: list[tuple[int, int, dict]] = []
+        for candidate in candidates:
+            if any(
+                candidate[0] < other[1] and other[0] < candidate[1]
+                for other in kept
+            ):
+                continue
+            kept.append(candidate)
+        kept.sort(key=lambda item: item[0])
+        return kept
+
+    def _extract_tool_calls(self, text: str) -> list[dict]:
+        """Extract tool call signatures from model output text.
+
+        Thin wrapper over :meth:`_extract_tool_calls_with_spans` that
+        drops the record spans; this is the shape callers assert on.
+        """
+        return [call for _, _, call in self._extract_tool_calls_with_spans(text)]
+
+    @staticmethod
+    def _prose_remainder(text: str, spans: list[tuple[int, int]]) -> str:
+        """Return ``text`` with the given (start, end) spans removed.
+
+        Used for kind inference (N1, 2026-11-13): a block that mixes
+        natural-language prose with tool-call records keeps its prose
+        once the records are stripped, so the language rule can judge
+        the prose alone. Spans must be sorted and non-overlapping, as
+        produced by :meth:`_extract_tool_calls_with_spans`.
+        """
+        parts: list[str] = []
+        pos = 0
+        for start, end in spans:
+            parts.append(text[pos:start])
+            pos = max(pos, end)
+        parts.append(text[pos:])
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _is_tool_call_value(value: object) -> bool:
+        return (
+            isinstance(value, dict)
+            and isinstance(value.get("name"), str)
+            and isinstance(value.get("parameters"), dict)
+        )
+
+    @staticmethod
+    def _envelope_has_prose(value: object) -> bool:
+        """True when a non-call string in ``value`` reads as prose."""
+        if isinstance(value, dict):
+            if LoopDetector._is_tool_call_value(value):
+                return False
+            for key, item in value.items():
+                if isinstance(key, str) and (
+                    any(ch.isspace() for ch in key)
+                    or re.search(r"[\u4e00-\u9fff]", key)
+                ):
+                    return True
+                if key == "tool_calls" and isinstance(item, list):
+                    # Call records (and anything nested in them)
+                    # are the envelope's payload, not prose.
+                    continue
+                if LoopDetector._envelope_has_prose(item):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(LoopDetector._envelope_has_prose(item) for item in value)
+        if isinstance(value, str):
+            return (
+                any(ch.isspace() for ch in value)
+                or re.search(r"[\u4e00-\u9fff]", value) is not None
+            )
+        return False
+
+    @staticmethod
+    def _scan_json_objects(text: str) -> list[tuple[int, int, object]]:
+        """Return (start, end, value) for every JSON object in ``text``."""
+        decoder = json.JSONDecoder()
+        objects: list[tuple[int, int, object]] = []
+        pos = 0
+        while True:
+            brace = re.search(r"\{", text[pos:])
+            if brace is None:
+                break
+            start = pos + brace.start()
+            try:
+                candidate, end = decoder.raw_decode(text[start:])
+            except (json.JSONDecodeError, ValueError):
+                pos = start + 1
+                continue
+            objects.append((start, start + end, candidate))
+            pos = start + 1
+        return objects
+
+    @staticmethod
+    def _outermost_pure_container(
+        objects: list[tuple[int, int, object]], start: int, end: int
+    ) -> tuple[int, int]:
+        """Walk a span outward through pure containing JSON objects.
+
+        At each step the smallest strictly containing object is taken,
+        but only when it is pure (see :meth:`_envelope_has_prose`):
+        the walk stops at the first impure layer, so prose in any
+        layer stays visible to kind inference exactly as an unwrapped
+        mixed block does (N1). A pure layer never hides prose from an
+        outer layer -- any non-call prose inside it is also inside
+        the outer object -- so stopping at the first impure layer
+        cannot miss a pure outer envelope.
+        """
+        cur_start, cur_end = start, end
+        while True:
+            containing = [
+                (obj_start, obj_end, obj)
+                for obj_start, obj_end, obj in objects
+                if obj_start <= cur_start and cur_end <= obj_end
+                and (obj_start, obj_end) != (cur_start, cur_end)
+            ]
+            if not containing:
+                break
+            obj_start, obj_end, obj = min(
+                containing, key=lambda item: item[1] - item[0]
+            )
+            if isinstance(obj, dict) and not LoopDetector._envelope_has_prose(obj):
+                cur_start, cur_end = obj_start, obj_end
+            else:
+                break
+        return cur_start, cur_end
+
+    @staticmethod
+    def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Return sorted, non-overlapping spans from an unsorted set."""
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(spans):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @staticmethod
+    def _empty_tool_call_spans(text: str) -> list[tuple[int, int]]:
+        """Spans of pure JSON envelopes whose ``tool_calls`` is empty.
+
+        A block such as ``{"role": "assistant", "tool_calls": []}``
+        carries no call record, so
+        :meth:`_extract_tool_calls_with_spans` finds nothing -- yet
+        its bare key names (``role`` / ``assistant`` /
+        ``tool_calls``) are still mistaken for English prose by kind
+        inference, and a repeated empty-tool-call sequence drifts in
+        a Chinese task exactly like the N2 wrapped-call case. Such an
+        envelope is stripped like a call record, but only when it is
+        pure: an envelope carrying real prose (e.g. a multi-word
+        ``"note"`` value) is left in place. Nested pure envelopes
+        are walked outward to the outermost pure layer, the same as
+        for call records. Returns sorted, non-overlapping spans.
+        """
+        objects = LoopDetector._scan_json_objects(text)
+        spans: list[tuple[int, int]] = []
+        for start, end, obj in objects:
+            if (
+                isinstance(obj, dict)
+                and isinstance(obj.get("tool_calls"), list)
+                and obj.get("tool_calls") == []
+                and not LoopDetector._envelope_has_prose(obj)
+            ):
+                spans.append(
+                    LoopDetector._outermost_pure_container(objects, start, end)
+                )
+        return LoopDetector._merge_spans(spans)
+
+    @staticmethod
+    def _extend_spans_with_envelopes(
+        text: str, spans: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """Extend call-record spans to their pure JSON envelope (N2).
+
+        A tool call is often wrapped in an outer object such as
+        ``{"role": "assistant", "tool_calls": [<call>]}``. Stripping
+        only the inner call record leaves the envelope's key names
+        (``role`` / ``assistant`` / ``tool_calls``) behind, and kind
+        inference then mistakes those bare JSON tokens for English
+        prose -- a pure tool sequence drifts in a Chinese task (N2,
+        review round 11). The envelope is stripped together with the
+        call, but only when it is *pure*: every string key/value in
+        the envelope outside the call records themselves must be a
+        single token with no whitespace and no CJK characters. An
+        envelope carrying real prose (e.g. a multi-word ``"note"``
+        value) is left in place, so prose hidden inside a wrapper
+        still counts as text exactly as an unwrapped mixed block
+        does (N1). A call wrapped in several pure layers (e.g.
+        ``{"assistant_response": {"wrapper_layer": {...}}}``) is
+        stripped out to the outermost pure layer, one layer at a
+        time. Returns sorted, non-overlapping spans.
+        """
+        if not spans:
+            return list(spans)
+        objects = LoopDetector._scan_json_objects(text)
+        extended = list(spans)
+        for start, end in spans:
+            extended.append(
+                LoopDetector._outermost_pure_container(objects, start, end)
+            )
+        return LoopDetector._merge_spans(extended)
+
+    def _check_tool_cycle(self):
+        """Detect a repeating tool-call cycle (A-B-A-B, up to 4-step patterns).
+
+        Looks at the most recent signatures only. Returns True when a
+        pattern of CYCLE_PERIODS length has repeated CYCLE_REPEATS times,
+        unless the pattern mixes read-class and write-class tools (normal
+        repair work). Only the tool names and a hash of the pattern are
+        reported; parameter values never enter the output. Callers check
+        after every call is appended (M4), so a cycle is caught the moment
+        it completes even if later calls in the same block follow it.
+        """
+        signatures = list(self.cycle_signatures)
+        for period in CYCLE_PERIODS:
+            needed = period * CYCLE_REPEATS
+            if len(signatures) < needed:
+                continue
+            window = signatures[-needed:]
+            pattern = window[:period]
+            if window[period:] != pattern:
+                continue
+            tools = {name for name, _ in pattern}
+            if tools & READ_TOOLS and tools & WRITE_TOOLS:
+                continue
+            pattern_text = json.dumps(pattern, sort_keys=True)
+            self.loop_detected = True
+            self.loop_reason = (
+                f"Detected tool-call cycle: {period}-step pattern repeated "
+                f"{CYCLE_REPEATS} times"
+            )
+            self.loop_details = {
+                "type": "tool_call_cycle",
+                "period": period,
+                "repeats": CYCLE_REPEATS,
+                "tools": sorted(tools),
+                "pattern_hash": hashlib.sha256(pattern_text.encode("utf-8")).hexdigest()[:16],
+            }
+            self._log("LOOP_DETECTED", self.loop_reason)
+            return True
+        return False
+
+    def _check_identical_tool_calls(self):
+        """Flag ``repeat_threshold`` consecutive identical tool calls (Rule 2).
+
+        Checked after every call is appended, not only at the end of a
+        block (M1, 2026-11-12 all-repo review): a trailing different call
+        in the same block must not mask a repeat that already completed
+        mid-block. Returns True when a loop was flagged.
+        """
+        if len(self.tool_calls) < self.repeat_threshold:
+            return False
+        recent_tools = list(self.tool_calls)[-self.repeat_threshold:]
+        tool_sigs = [(t["name"], t["params"]) for t in recent_tools]
+        if len(set(tool_sigs)) != 1:
+            return False
+        self.loop_detected = True
+        name, params = tool_sigs[0]
+        self.loop_reason = (
+            f"Detected {len(recent_tools)} consecutive identical "
+            f"tool calls: {name}"
+        )
+        self.loop_details = {
+            "type": "identical_tool_calls",
+            "tool": name,
+            "params_hash": self._params_hash(params),
+            "repeats": len(recent_tools),
+        }
+        self._log(
+            "LOOP_DETECTED",
+            f"{self.loop_reason}\n  Params hash: {self.loop_details['params_hash']}",
+        )
+        return True
+
+    def _check_repeated_side_effect(self):
+        """Flag two identical side-effecting tool calls (Rule 2b).
+
+        Checked after every call is appended, for the same reason as
+        ``_check_identical_tool_calls`` (M1, 2026-11-12 all-repo review):
+        the second identical side-effecting call is already a stop
+        signal, even if a different call follows it in the same block.
+        Returns True when a loop was flagged.
+        """
+        if len(self.tool_calls) < 2:
+            return False
+        previous, current = list(self.tool_calls)[-2:]
+        if not (
+            previous["name"] == current["name"]
+            and previous["params"] == current["params"]
+            and current["name"] in SIDE_EFFECT_TOOLS
+        ):
+            return False
+        self.loop_detected = True
+        self.loop_reason = f"Detected repeated side-effecting tool call: {current['name']}"
+        self.loop_details = {
+            "type": "repeated_side_effect_tool_call",
+            "tool": current["name"],
+            "params_hash": self._params_hash(current["params"]),
+            "repeats": 2,
+        }
+        self._log("LOOP_DETECTED", self.loop_reason)
+        return True
+
+    def _repeated_ngram_evidence(self, text: str) -> dict | None:
+        """Detect repetition inside one long block.
+
+        A 5-word shingle must occur at least 5 times and repeated material
+        must cover at least half of the block. Short blocks are skipped:
+        below 50 words there is not enough material to judge. Occurrence
+        count and coverage are computed over the same set of phrases: only
+        phrases occurring at least 5 times contribute coverage (M2), so a
+        block cannot clear the coverage bar with phrases that merely
+        occurred twice.
+        """
+        words = text.split()
+        if len(words) < NGRAM_MIN_WORDS:
+            return None
+        lowered = [word.casefold() for word in words]
+        starts: dict[tuple[str, ...], list[int]] = {}
+        for index in range(len(lowered) - NGRAM_WORDS + 1):
+            key = tuple(lowered[index:index + NGRAM_WORDS])
+            starts.setdefault(key, []).append(index)
+        max_occurrences = max(len(positions) for positions in starts.values())
+        if max_occurrences < NGRAM_MIN_OCCURRENCES:
+            return None
+        covered: set[int] = set()
+        for positions in starts.values():
+            if len(positions) >= NGRAM_MIN_OCCURRENCES:
+                for start in positions:
+                    covered.update(range(start, start + NGRAM_WORDS))
+        coverage = len(covered) / len(words)
+        if coverage < NGRAM_MIN_COVERAGE:
+            return None
+        return {
+            "type": "repeated_ngram_within_block",
+            "ngram_words": NGRAM_WORDS,
+            "occurrences": max_occurrences,
+            "block_words": len(words),
+            "coverage": round(coverage, 3),
+            "evidence": self._block_evidence(text),
+        }
 
     def _log(self, level: str, message: str):
         """Output a log message."""
@@ -167,12 +866,18 @@ class LoopDetector:
             return
         print(f"[{timestamp}] [{level}] {message}", flush=True)
 
-    def process_block(self, text: str, block_time: float | None = None):
+    def process_block(self, text: str, block_time: float | None = None, event_kind: str | None = None):
         """Process a single output block from the model.
 
         Args:
             text: The model output text for this block
             block_time: Timestamp when this block was emitted (unix epoch)
+            event_kind: "text" for natural-language output, "tool_call"
+                for a structured tool-call record. When None the kind is
+                inferred from the tool calls extracted from the block: a
+                block that still has prose after its call records are
+                stripped counts as "text" (N1). The language rule only
+                applies to "text" blocks (M3).
         """
         if block_time is None:
             block_time = time.time()
@@ -184,33 +889,132 @@ class LoopDetector:
         self.blocks.append(text)
         self.block_timestamps.append(block_time)
 
+        # Track the run of consecutive identical blocks: the duration gate
+        # (Rule 1) measures this run, not the last three blocks (M2,
+        # 2026-11-12 all-repo review). A run that has been repeating the
+        # same text for ten minutes must clear a three-minute gate even
+        # though any three consecutive blocks span only twenty seconds.
+        # Exact repetition only: a block that merely resembles the run
+        # base (different file, one word changed) starts a new run, so
+        # distinct work never accumulates into a duration signal.
+        if text != self._identical_run_base:
+            self._identical_run_base = text
+            self._identical_run_start = block_time
+
         # Tool calls must be consecutive output events. A normal model/result
         # block between calls is evidence of progress, so do not carry an old
         # call across it when evaluating a call-loop.
-        tools = self._extract_tool_calls(text)
+        tools_with_spans = self._extract_tool_calls_with_spans(text)
+        tools = [call for _, _, call in tools_with_spans]
+        if event_kind is None:
+            if not tools:
+                # No call record: a block that is nothing but a pure
+                # empty-tool-call envelope (``{"role": "assistant",
+                # "tool_calls": []}``) is structured tool output, not
+                # prose -- its bare key names must not drift (empty
+                # tool_calls, review round 12 follow-up). Anything
+                # left after stripping such envelopes is judged as
+                # prose, exactly as for mixed blocks below.
+                empty_spans = self._empty_tool_call_spans(text)
+                if empty_spans:
+                    remainder = self._prose_remainder(text, empty_spans)
+                    if re.search(r"[A-Za-z\u4e00-\u9fff]", remainder):
+                        kind = "text"
+                        language_text = remainder
+                    else:
+                        kind = "tool_call"
+                        language_text = ""
+                else:
+                    kind = "text"
+                    language_text = text
+            else:
+                # A block that mixes prose with tool-call records is
+                # natural-language output for the language rule as long
+                # as prose remains once the records are stripped (N1,
+                # 2026-11-13): an English explanation followed by a
+                # ``read`` JSON record is still English output drifting
+                # from a Chinese task. Only a block that is nothing but
+                # call records counts as a tool_call (M3). Pure
+                # empty-tool-call envelopes in the same block are
+                # stripped alongside the call records.
+                remainder = self._prose_remainder(
+                    text,
+                    self._merge_spans(
+                        self._extend_spans_with_envelopes(
+                            text, [(start, end) for start, end, _ in tools_with_spans]
+                        )
+                        + self._empty_tool_call_spans(text)
+                    ),
+                )
+                if re.search(r"[A-Za-z\u4e00-\u9fff]", remainder):
+                    kind = "text"
+                    language_text = remainder
+                else:
+                    kind = "tool_call"
+                    language_text = ""
+        elif event_kind in ("text", "tool_call"):
+            kind = event_kind
+            language_text = text if kind == "text" else ""
+        else:
+            raise ValueError("event_kind must be 'text' or 'tool_call'")
+        self.block_kinds.append(kind)
+        self.block_language_texts.append(language_text)
         if not tools:
             self.tool_calls.clear()
         for t in tools:
             self.tool_calls.append(t)
+            # Cycle signatures accumulate across result blocks; the
+            # consecutive-call deque above is cleared by plain blocks.
+            self.cycle_signatures.append((t["name"], t["params"]))
+            # Check on every call, not only at the end of the block (M4):
+            # a cycle completes the moment its last call arrives, and later
+            # calls in the same block must not mask it.
+            if not self.loop_detected:
+                self._check_tool_cycle()
+            # Same per-call rule for identical calls and repeated side
+            # effects (M1, 2026-11-12 all-repo review): a repeat that
+            # already completed mid-block is a signal worth keeping, even
+            # if a different call follows it in the same block.
+            if not self.loop_detected:
+                self._check_identical_tool_calls()
+            if not self.loop_detected:
+                self._check_repeated_side_effect()
+        self.total_tool_calls += len(tools)
 
         # A configured Chinese task that repeatedly produces English-only
         # output is an actionable drift signal. It is opt-in because language
         # cannot be inferred safely from an arbitrary log.
         if self.expected_language == "zh" and len(self.blocks) >= self.repeat_threshold:
-            recent_blocks = list(self.blocks)[-self.repeat_threshold:]
-            if all(self._looks_english(block) for block in recent_blocks):
+            recent_kinds = list(self.block_kinds)[-self.repeat_threshold:]
+            recent_texts = list(self.block_language_texts)[-self.repeat_threshold:]
+            # Only natural-language output counts (M3, 2026-11-12 all-repo
+            # review): a structured tool-call record is English-looking
+            # JSON by construction -- its arguments are replaced by a
+            # fingerprint -- so it must never count as drift evidence.
+            # The check runs on the prose left after stripping call
+            # records (N1, 2026-11-13), never on the records
+            # themselves: English words inside tool parameters are not
+            # assistant prose and must not tip the heuristic.
+            if all(kind == "text" for kind in recent_kinds) and all(
+                self._looks_english(language_text) for language_text in recent_texts
+            ):
                 self.loop_detected = True
                 self.loop_reason = "Detected repeated English-only output in a Chinese task"
                 self.loop_details = {
                     "type": "language_drift",
                     "expected_language": "zh",
-                    "repeats": len(recent_blocks),
+                    "repeats": len(recent_texts),
                 }
                 self._log("LOOP_DETECTED", self.loop_reason)
                 return
 
         # --- Rule 1: Consecutive identical output blocks ---
-        if len(self.blocks) >= self.repeat_threshold:
+        # Guarded like Rules 4-5: a signal already raised earlier in this
+        # block (e.g. identical tool calls, checked per call) is kept,
+        # not overwritten by a later rule (M1, 2026-11-12 all-repo review).
+        # Before the per-call move, the end-of-block Rule 2 ran after
+        # Rule 1 and overwrote its verdict; the first signal now wins.
+        if not self.loop_detected and len(self.blocks) >= self.repeat_threshold:
             recent = list(self.blocks)[-self.repeat_threshold:]
             # Check if all recent blocks are identical or highly similar
             base = recent[0]
@@ -220,7 +1024,12 @@ class LoopDetector:
             )
 
             if identical:
-                duration = block_time - self.block_timestamps[-self.repeat_threshold]
+                # Duration of the whole consecutive-identical run (M2,
+                # 2026-11-12 all-repo review), not just the last three
+                # blocks: with ten-second spacing the last three blocks
+                # always span twenty seconds and can never reach a
+                # three-minute gate, however long the run has lasted.
+                duration = block_time - self._identical_run_start
                 # Also check duration threshold (default 3 min)
                 if self.text_mode == "instant" or duration >= self.time_threshold:
                     self.loop_detected = True
@@ -241,52 +1050,51 @@ class LoopDetector:
                         f"{self.loop_reason}\n  Text hash: {self.loop_details['evidence']['text_hash']}",
                     )
 
-        # --- Rule 2: Same tool called 3+ times with identical params ---
-        if len(self.tool_calls) >= self.repeat_threshold:
-            recent_tools = list(self.tool_calls)[-self.repeat_threshold:]
-            tool_sigs = [(t["name"], t["params"]) for t in recent_tools]
-            if len(set(tool_sigs)) == 1:
-                self.loop_detected = True
-                name, params = tool_sigs[0]
-                self.loop_reason = (
-                    f"Detected {len(recent_tools)} consecutive identical "
-                    f"tool calls: {name}"
-                )
-                self.loop_details = {
-                    "type": "identical_tool_calls",
-                    "tool": name,
-                    "params_hash": self._params_hash(params),
-                    "repeats": len(recent_tools),
-                }
-                self._log(
-                    "LOOP_DETECTED",
-                    f"{self.loop_reason}\n  Params hash: {self.loop_details['params_hash']}",
-                )
+        # --- Rule 3: Tool-call cycle (A-B-A-B) ---
+        if not self.loop_detected:
+            self._check_tool_cycle()
 
-        # External side effects must not be retried blindly. Two identical
-        # attempts are enough to stop and require a fresh safety review.
-        if len(self.tool_calls) >= 2:
-            previous, current = list(self.tool_calls)[-2:]
-            if (
-                previous["name"] == current["name"]
-                and previous["params"] == current["params"]
-                and current["name"] in SIDE_EFFECT_TOOLS
-            ):
+        # --- Rule 4: Repeated n-grams inside one long block ---
+        if not self.loop_detected:
+            ngram = self._repeated_ngram_evidence(text)
+            if ngram is not None:
                 self.loop_detected = True
-                self.loop_reason = f"Detected repeated side-effecting tool call: {current['name']}"
-                self.loop_details = {
-                    "type": "repeated_side_effect_tool_call",
-                    "tool": current["name"],
-                    "params_hash": self._params_hash(current["params"]),
-                    "repeats": 2,
-                }
+                self.loop_reason = (
+                    f"Detected repeated {ngram['ngram_words']}-word phrase "
+                    f"{ngram['occurrences']} times inside one block"
+                )
+                self.loop_details = ngram
                 self._log("LOOP_DETECTED", self.loop_reason)
+
+        # --- Rule 5 (opt-in): Tool-call budget ceiling ---
+        if (
+            not self.loop_detected
+            and self.max_tool_calls is not None
+            and self.total_tool_calls > self.max_tool_calls
+        ):
+            self.loop_detected = True
+            self.loop_reason = (
+                f"Tool-call budget exceeded: {self.total_tool_calls} calls "
+                f"(limit {self.max_tool_calls})"
+            )
+            self.loop_details = {
+                "type": "tool_call_budget_exceeded",
+                "total_tool_calls": self.total_tool_calls,
+                "max_tool_calls": self.max_tool_calls,
+            }
+            self._log("LOOP_DETECTED", self.loop_reason)
 
     def reset(self):
         """Reset detector state."""
         self.blocks.clear()
         self.tool_calls.clear()
         self.block_timestamps.clear()
+        self.block_kinds.clear()
+        self.block_language_texts.clear()
+        self._identical_run_base = None
+        self._identical_run_start = None
+        self.cycle_signatures.clear()
+        self.total_tool_calls = 0
         self.loop_detected = False
         self.loop_reason = ""
         self.loop_details = {}
@@ -299,6 +1107,7 @@ class LoopDetector:
             "details": self.loop_details,
             "blocks_processed": len(self.blocks),
             "tool_calls_tracked": len(self.tool_calls),
+            "total_tool_calls": self.total_tool_calls,
         }
 
 
@@ -424,6 +1233,15 @@ Examples:
         choices=["zh"],
         help="Enable language-drift detection for an explicitly Chinese task",
     )
+    parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=None,
+        help=(
+            "Optional last-resort ceiling: flag once the total number of "
+            "tool calls exceeds N (default: no ceiling)"
+        ),
+    )
     args = parser.parse_args()
 
     if args.threshold < 2:
@@ -432,6 +1250,8 @@ Examples:
         parser.error("--timeout must be non-negative")
     if not 0.0 <= args.similarity <= 1.0:
         parser.error("--similarity must be between 0 and 1")
+    if args.max_tool_calls is not None and args.max_tool_calls < 1:
+        parser.error("--max-tool-calls must be a positive integer")
 
     # Create detector
     detector = LoopDetector(
@@ -441,6 +1261,7 @@ Examples:
         text_mode=args.text_mode,
         json_output=args.json,
         expected_language=args.expect_language,
+        max_tool_calls=args.max_tool_calls,
     )
 
     # Read input

@@ -11,13 +11,24 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .detect_loop import strip_volatile_params
+
 
 @dataclass(frozen=True)
 class NormalizedEvent:
-    """A single detector input block with an optional source timestamp."""
+    """A single detector input block with an optional source timestamp.
+
+    ``kind`` preserves the event type so the detector can tell natural
+    language output ("text") from a structured tool-call record
+    ("tool_call"): the language rule only applies to the former (M3,
+    2026-11-12 all-repo review). A tool call's normalized form is
+    English-looking JSON by construction -- its arguments are replaced
+    by a fingerprint -- so it must never count as drift evidence.
+    """
 
     text: str
     timestamp: float | None = None
+    kind: str = "text"
 
 
 def _text(value: Any) -> str:
@@ -40,7 +51,10 @@ def _tool_text(name: Any, arguments: Any) -> str:
     else:
         raise ValueError("tool arguments must be a JSON string or object")
     try:
-        canonical = json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        canonical = json.dumps(
+            strip_volatile_params(params),
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError("tool arguments must be JSON-serializable") from exc
     fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -84,7 +98,11 @@ def normalize_event(event: str | Mapping[str, Any]) -> NormalizedEvent:
     if kind == "text":
         return NormalizedEvent(_text(event.get("text")), timestamp)
     if kind == "tool_call":
-        return NormalizedEvent(_tool_text(event.get("name"), event.get("arguments")), timestamp)
+        return NormalizedEvent(
+            _tool_text(event.get("name"), event.get("arguments")),
+            timestamp,
+            kind="tool_call",
+        )
     if kind == "assistant":
         content = event.get("content")
         if isinstance(content, str):

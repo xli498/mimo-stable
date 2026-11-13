@@ -1,0 +1,8 @@
+--- BLOCK 1 at 2026-01-01T00:00:00+00:00 ---
+{"name":"read","parameters":{"path":"a.txt"}}
+--- BLOCK 2 at 2026-01-01T00:00:10+00:00 ---
+{"name":"write","parameters":{"path":"b.txt","text":"draft"}}
+--- BLOCK 3 at 2026-01-01T00:00:20+00:00 ---
+{"name":"read","parameters":{"path":"a.txt"}}
+--- BLOCK 4 at 2026-01-01T00:00:30+00:00 ---
+{"name":"write","parameters":{"path":"b.txt","text":"draft"}}

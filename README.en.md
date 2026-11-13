@@ -58,8 +58,11 @@ summary looks like this:
 The detector is designed for observable signals such as:
 
 - consecutive identical or near-identical output blocks;
-- repeated tool calls, including normalized JSON key order;
-- repeated calls only when their output blocks are consecutive;
+- repeated identical tool calls, including normalized JSON key order, only
+  when their output blocks are consecutive;
+- tool-call cycles (a 2–4 step pattern repeating twice) even when plain
+  result blocks appear between the calls, because cycle signatures are
+  tracked across result blocks;
 - language drift and related output anomalies when evidence supports them.
 
 Detection results are signals, not model-level explanations. MiMo is the initial

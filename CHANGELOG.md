@@ -2,6 +2,81 @@
 
 All notable changes to LLM Degenerate Loop Guardrails.
 
+## [1.2.0] - 2026-11-09
+
+### Added
+- Added tool-call cycle detection: a 2–4 step tool-call pattern repeating twice
+  is a loop signal (`tool_call_cycle`); read/write mixes are exempt as
+  productive repair work.
+- Added within-block n-gram repetition detection: a 5-word phrase occurring
+  5+ times and covering half of a block of 50+ words is a loop signal
+  (`repeated_ngram_within_block`).
+- Added an opt-in tool-call budget ceiling (`--max-tool-calls`,
+  `inspect_events(..., max_tool_calls=N)`); off by default.
+- Tool-call identity now ignores top-level volatile metadata keys
+  (`request_id`, `trace_id`, `created_at`, `timestamp`, `nonce`), so a loop
+  cannot hide behind regenerated request ids. The same key nested inside a
+  business payload is kept: it is business content, not call metadata.
+
+### Fixed
+- Volatile-key denoising no longer strips fields nested inside a business
+  payload, so two writes that differ only in a timestamp inside the content
+  being written are no longer reported as the same call.
+- Within-block n-gram coverage is now computed over the same phrases as the
+  occurrence bar: only phrases occurring 5+ times contribute coverage.
+- Tool-call extraction no longer counts a nested example inside a JSON call
+  record as a second call, and now counts every function-style call on its
+  own line in one block; CLI and structured-API counts agree.
+- Tool-call cycles are now checked as each call arrives, so a cycle is still
+  reported when later calls in the same block follow it.
+- Function-style calls whose arguments parse as a JSON object now use the
+  same normalization and volatile-key denoising as JSON records.
+- Function-style call arguments are now scanned with quote awareness, so a
+  ")" inside a quoted JSON string value (or an escaped quote just before
+  one) no longer truncates the arguments or misreports distinct writes as
+  a repeated side-effecting call; CLI and structured-API counts agree.
+- Zero-argument function-style calls (e.g. `browser()`) are now counted
+  with params normalized to `{}`, exactly as the structured API counts
+  `arguments: {}`; previously the CLI silently dropped them and could
+  miss a tool-call budget breach the API would report.
+- A zero-argument function-style name at the start of a line is only
+  counted as a call when the closing `)` ends the call record (only
+  whitespace may follow it on the same line). Ordinary prose that
+  mentions a tool this way (e.g. `write() denotes the writer interface
+  ...`) is no longer misreported as a repeated side-effecting call;
+  a standalone `browser()` on its own line still counts exactly as
+  before.
+- The same complete-call-record boundary now also applies to
+  function-style calls *with* arguments: a line-start name with
+  arguments followed by prose on the same line (e.g.
+  `write({"path": ...}) denotes ...`) is documentation mentioning the
+  tool, not a call, and is no longer misreported as a repeated
+  side-effecting call; a standalone `write({...})` on its own line
+  still counts exactly as before.
+- The line-start prose exclusion now also covers a tool-shaped JSON
+  object nested inside the excluded mention's arguments (e.g. the
+  `send` inside `write({"name": "send", ...}) denotes ...`): the
+  inner object is no longer counted as a call of its own, so such
+  prose is no longer misreported as a repeated side-effecting call;
+  a standalone `write({...})` on its own line still counts exactly
+  as before, extracting only the outer call. This also holds when
+  the mention's parentheses never balance and the nested JSON spans
+  several lines: the exclusion span stretches to cover a JSON
+  object that starts on the mention's line, instead of stopping at
+  that line's end. The same exclusion now also covers an ordinary
+  (non-tool-shaped) config JSON object that the mention's argument
+  opens with: when the parentheses never balance and the tool-shaped
+  object is nested inside that outer object on a later line (e.g.
+  `write({"path": "config.json", "content": {"name": "send", ...}}`
+  with no closing `)`), the exclusion span stretches to the end of
+  the outer object, so the inner object is no longer counted as a
+  call of its own. This also holds when the `{` is moved to the line
+  after `write(`. A real call on a later line, a bare JSON record,
+  and the tool-call budget are unaffected.
+- Corrected the English README: the "consecutive output blocks" rule applies
+  to repeated identical calls, while tool-call cycles are tracked across
+  plain result blocks.
+
 ## [1.1.5] - 2026-08-28
 
 ### Added

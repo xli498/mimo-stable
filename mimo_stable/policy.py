@@ -8,7 +8,16 @@ def decide(summary: dict[str, Any], *, retryable: bool = False, retry_count: int
     """Return a conservative action without performing side effects."""
     if not isinstance(summary, Mapping):
         raise ValueError("summary must be a JSON object")
-    detected = summary.get("loop_detected", False)
+    # An error report is not a detection result: it carries no
+    # loop_detected verdict, so it must never be read as "no loop was
+    # found" (M4, 2026-11-12 all-repo review). The detector CLI emits
+    # {"error": "no_input"} on empty input; feeding that to the recovery
+    # CLI used to return action="continue".
+    if "error" in summary:
+        raise ValueError("summary is an error report, not a detection summary")
+    if "loop_detected" not in summary:
+        raise ValueError("summary must include loop_detected")
+    detected = summary["loop_detected"]
     if not isinstance(detected, bool):
         raise ValueError("loop_detected must be a JSON boolean")
     if not isinstance(retry_count, int) or isinstance(retry_count, bool) or retry_count < 0:

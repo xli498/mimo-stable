@@ -30,5 +30,12 @@ python3 scripts/detect_loop.py \
   --log fixtures/side_effect_repeat.log
 ```
 
+A JSON object is one call record: an example nested inside its parameters
+is not counted as a second call. Function-style calls may appear several to
+a block, one per line. When a function-style argument parses as a JSON
+object it is normalized the same way as a JSON record (keys sorted,
+top-level volatile keys such as `request_id` ignored); any other argument
+syntax is compared verbatim.
+
 The detector does not execute, cancel, or retry the tool. The outer runner must
 perform its own idempotency and outcome checks before taking action.
