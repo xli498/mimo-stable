@@ -1324,6 +1324,163 @@ def test_must_n2_wrapped_tool_json():
     print("Must N2 wrapped-tool-JSON regression tests passed")
 
 
+def test_envelope_nested_pure_json():
+    """Regression test for nested pure envelopes (review round 12
+    follow-up, 2026-11-13).
+
+    Three read calls wrapped in *two* pure layers
+    (``{"assistant_response": {"wrapper_layer": {...}}}``) must not
+    drift in a Chinese task: the N2 fix stripped only the smallest
+    containing envelope, leaving the outer layer's key names behind
+    and mistaking them for English prose. The extension now walks
+    outward through every pure layer. Controls: a multi-word
+    English ``note`` in the inner layer still drifts, a note in
+    only the outer layer still drifts (the walk stops at the first
+    impure layer), and prose trailing a nested envelope still
+    drifts.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_stdin(text, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--text-mode", "instant",
+             "--expect-language", "zh", *extra_args],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    rc, data = (lambda p: (p.returncode, json.loads(p.stdout)))(
+        subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+             "--expect-language", "zh", "--text-mode", "instant",
+             "--log", str(ROOT / "fixtures" / "must_envelope_nested_pure_json.log")],
+            capture_output=True, text=True))
+    assert rc == 0 and data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 3, data
+
+    # API half: the same nested records through the detector's kind
+    # inference (event_kind=None, as the CLI feeds stdin blocks).
+    detector = LoopDetector(expected_language="zh", text_mode="instant")
+    for block in (
+        '{"assistant_response":{"wrapper_layer":{"role":"assistant","tool_calls":[{"name":"read","parameters":{"path":"src/alpha/reports/monthly.csv"}}]}}}',
+        '{"assistant_response":{"wrapper_layer":{"role":"assistant","tool_calls":[{"name":"read","parameters":{"path":"docs/architecture/service-map.md"}}]}}}',
+        '{"assistant_response":{"wrapper_layer":{"role":"assistant","tool_calls":[{"name":"read","parameters":{"path":"tests/smoke/results/output.json"}}]}}}',
+    ):
+        detector.process_block(block)
+    assert detector.loop_detected is False, detector.summary()
+
+    # Control: a multi-word note inside the inner wrapper still drifts.
+    notes = [
+        "Please review this file carefully today",
+        "Please examine the second document thoroughly now",
+        "Please inspect the third output file in detail",
+    ]
+    inner_note = "".join(
+        '{"assistant_response":{"wrapper_layer":{"role":"assistant","note":"%s","tool_calls":[{"name":"read","parameters":{"path":"file0%d.txt"}}]}}}\n\n'
+        % (note, i + 1)
+        for i, note in enumerate(notes)
+    )
+    rc, data = cli_stdin(inner_note)
+    assert rc == 1 and data["details"]["type"] == "language_drift", (rc, data)
+
+    # Control: a note in only the outer layer still drifts -- the
+    # outward walk stops at the first impure layer, so the outer
+    # wrapper's prose stays visible even though the inner layer is
+    # pure.
+    outer_note = "".join(
+        '{"assistant_response":{"note":"%s","wrapper_layer":{"role":"assistant","tool_calls":[{"name":"read","parameters":{"path":"file0%d.txt"}}]}}}\n\n'
+        % (note, i + 1)
+        for i, note in enumerate(notes)
+    )
+    rc, data = cli_stdin(outer_note)
+    assert rc == 1 and data["details"]["type"] == "language_drift", (rc, data)
+
+    # Control: prose trailing a nested envelope still drifts.
+    trailing = "".join(
+        '{"assistant_response":{"wrapper_layer":{"role":"assistant","tool_calls":[{"name":"read","parameters":{"path":"file0%d.txt"}}]}}} %s English explanation after the tool call with enough words to drift.\n\n'
+        % (i + 1, first)
+        for i, first in enumerate(("First", "Second", "Third"))
+    )
+    rc, data = cli_stdin(trailing)
+    assert rc == 1 and data["details"]["type"] == "language_drift", (rc, data)
+    print("Envelope nested-pure-JSON regression tests passed")
+
+
+def test_envelope_empty_tool_calls():
+    """Regression test for empty ``tool_calls`` envelopes (review
+    round 12 follow-up, 2026-11-13).
+
+    Three pure envelopes with ``"tool_calls": []`` must not drift in
+    a Chinese task: they carry no call record, so the extractor
+    found nothing and kind inference mistook the bare key names
+    (``role`` / ``assistant`` / ``tool_calls``) for English prose.
+    The three blocks differ (extra single-token key, nested outer
+    layer) so Rule 1 identical-output does not mask the drift
+    check -- three *identical* empty envelopes are a real
+    repetition signal and still fire Rule 1 (pinned below).
+    Controls: an empty envelope carrying a multi-word English
+    ``note`` still drifts, and prose trailing an empty envelope
+    still drifts.
+    """
+    DETECTOR = ROOT / "scripts" / "detect_loop.py"
+
+    def cli_stdin(text, extra_args=()):
+        p = subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--text-mode", "instant",
+             "--expect-language", "zh", *extra_args],
+            input=text, capture_output=True, text=True)
+        return p.returncode, json.loads(p.stdout)
+
+    rc, data = (lambda p: (p.returncode, json.loads(p.stdout)))(
+        subprocess.run(
+            [sys.executable, str(DETECTOR), "--json", "--timeout", "60",
+             "--expect-language", "zh", "--text-mode", "instant",
+             "--log", str(ROOT / "fixtures" / "must_envelope_empty_tool_calls.log")],
+            capture_output=True, text=True))
+    assert rc == 0 and data["loop_detected"] is False, data
+    assert data["total_tool_calls"] == 0, data
+
+    # API half: the same empty envelopes through the detector's kind
+    # inference (event_kind=None, as the CLI feeds stdin blocks).
+    detector = LoopDetector(expected_language="zh", text_mode="instant")
+    for block in (
+        '{"role":"assistant","tool_calls":[]}',
+        '{"role":"assistant","session":"alpha","tool_calls":[]}',
+        '{"assistant_response":{"role":"assistant","tool_calls":[]}}',
+    ):
+        detector.process_block(block)
+    assert detector.loop_detected is False, detector.summary()
+
+    # Control: an empty envelope carrying a multi-word note still drifts.
+    notes = [
+        "Please review this file carefully today",
+        "Please examine the second document thoroughly now",
+        "Please inspect the third output file in detail",
+    ]
+    noted = "".join(
+        '{"role":"assistant","note":"%s","tool_calls":[]}\n\n' % note
+        for note in notes
+    )
+    rc, data = cli_stdin(noted)
+    assert rc == 1 and data["details"]["type"] == "language_drift", (rc, data)
+
+    # Control: prose trailing an empty envelope still drifts.
+    trailing = "".join(
+        '{"role":"assistant","tool_calls":[]} %s English explanation after the empty tool call with enough words to drift.\n\n'
+        % first
+        for first in ("First", "Second", "Third")
+    )
+    rc, data = cli_stdin(trailing)
+    assert rc == 1 and data["details"]["type"] == "language_drift", (rc, data)
+
+    # Pin the masking behaviour: three identical empty envelopes no
+    # longer drift, but the repetition itself is still a loop -- Rule 1
+    # fires on the identical output, not the language rule.
+    rc, data = cli_stdin('{"role":"assistant","tool_calls":[]}\n\n' * 3)
+    assert rc == 1 and data["loop_detected"] is True, (rc, data)
+    assert data["details"]["type"] == "consecutive_identical_output", data
+    print("Envelope empty-tool-calls regression tests passed")
+
+
 def test_detector_behavior_contract():
     DETECTOR=ROOT/"scripts"/"detect_loop.py"
 
@@ -1424,4 +1581,6 @@ if __name__ == "__main__":
     test_must_20261112_all_repo_review()
     test_must_n1_mixed_prose_tool_json()
     test_must_n2_wrapped_tool_json()
+    test_envelope_nested_pure_json()
+    test_envelope_empty_tool_calls()
     test_detector_behavior_contract()

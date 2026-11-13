@@ -552,6 +552,138 @@ class LoopDetector:
         return "".join(parts).strip()
 
     @staticmethod
+    def _is_tool_call_value(value: object) -> bool:
+        return (
+            isinstance(value, dict)
+            and isinstance(value.get("name"), str)
+            and isinstance(value.get("parameters"), dict)
+        )
+
+    @staticmethod
+    def _envelope_has_prose(value: object) -> bool:
+        """True when a non-call string in ``value`` reads as prose."""
+        if isinstance(value, dict):
+            if LoopDetector._is_tool_call_value(value):
+                return False
+            for key, item in value.items():
+                if isinstance(key, str) and (
+                    any(ch.isspace() for ch in key)
+                    or re.search(r"[\u4e00-\u9fff]", key)
+                ):
+                    return True
+                if key == "tool_calls" and isinstance(item, list):
+                    # Call records (and anything nested in them)
+                    # are the envelope's payload, not prose.
+                    continue
+                if LoopDetector._envelope_has_prose(item):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(LoopDetector._envelope_has_prose(item) for item in value)
+        if isinstance(value, str):
+            return (
+                any(ch.isspace() for ch in value)
+                or re.search(r"[\u4e00-\u9fff]", value) is not None
+            )
+        return False
+
+    @staticmethod
+    def _scan_json_objects(text: str) -> list[tuple[int, int, object]]:
+        """Return (start, end, value) for every JSON object in ``text``."""
+        decoder = json.JSONDecoder()
+        objects: list[tuple[int, int, object]] = []
+        pos = 0
+        while True:
+            brace = re.search(r"\{", text[pos:])
+            if brace is None:
+                break
+            start = pos + brace.start()
+            try:
+                candidate, end = decoder.raw_decode(text[start:])
+            except (json.JSONDecodeError, ValueError):
+                pos = start + 1
+                continue
+            objects.append((start, start + end, candidate))
+            pos = start + 1
+        return objects
+
+    @staticmethod
+    def _outermost_pure_container(
+        objects: list[tuple[int, int, object]], start: int, end: int
+    ) -> tuple[int, int]:
+        """Walk a span outward through pure containing JSON objects.
+
+        At each step the smallest strictly containing object is taken,
+        but only when it is pure (see :meth:`_envelope_has_prose`):
+        the walk stops at the first impure layer, so prose in any
+        layer stays visible to kind inference exactly as an unwrapped
+        mixed block does (N1). A pure layer never hides prose from an
+        outer layer -- any non-call prose inside it is also inside
+        the outer object -- so stopping at the first impure layer
+        cannot miss a pure outer envelope.
+        """
+        cur_start, cur_end = start, end
+        while True:
+            containing = [
+                (obj_start, obj_end, obj)
+                for obj_start, obj_end, obj in objects
+                if obj_start <= cur_start and cur_end <= obj_end
+                and (obj_start, obj_end) != (cur_start, cur_end)
+            ]
+            if not containing:
+                break
+            obj_start, obj_end, obj = min(
+                containing, key=lambda item: item[1] - item[0]
+            )
+            if isinstance(obj, dict) and not LoopDetector._envelope_has_prose(obj):
+                cur_start, cur_end = obj_start, obj_end
+            else:
+                break
+        return cur_start, cur_end
+
+    @staticmethod
+    def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Return sorted, non-overlapping spans from an unsorted set."""
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(spans):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @staticmethod
+    def _empty_tool_call_spans(text: str) -> list[tuple[int, int]]:
+        """Spans of pure JSON envelopes whose ``tool_calls`` is empty.
+
+        A block such as ``{"role": "assistant", "tool_calls": []}``
+        carries no call record, so
+        :meth:`_extract_tool_calls_with_spans` finds nothing -- yet
+        its bare key names (``role`` / ``assistant`` /
+        ``tool_calls``) are still mistaken for English prose by kind
+        inference, and a repeated empty-tool-call sequence drifts in
+        a Chinese task exactly like the N2 wrapped-call case. Such an
+        envelope is stripped like a call record, but only when it is
+        pure: an envelope carrying real prose (e.g. a multi-word
+        ``"note"`` value) is left in place. Nested pure envelopes
+        are walked outward to the outermost pure layer, the same as
+        for call records. Returns sorted, non-overlapping spans.
+        """
+        objects = LoopDetector._scan_json_objects(text)
+        spans: list[tuple[int, int]] = []
+        for start, end, obj in objects:
+            if (
+                isinstance(obj, dict)
+                and isinstance(obj.get("tool_calls"), list)
+                and obj.get("tool_calls") == []
+                and not LoopDetector._envelope_has_prose(obj)
+            ):
+                spans.append(
+                    LoopDetector._outermost_pure_container(objects, start, end)
+                )
+        return LoopDetector._merge_spans(spans)
+
+    @staticmethod
     def _extend_spans_with_envelopes(
         text: str, spans: list[tuple[int, int]]
     ) -> list[tuple[int, int]]:
@@ -570,84 +702,20 @@ class LoopDetector:
         envelope carrying real prose (e.g. a multi-word ``"note"``
         value) is left in place, so prose hidden inside a wrapper
         still counts as text exactly as an unwrapped mixed block
-        does (N1). Returns sorted, non-overlapping spans.
+        does (N1). A call wrapped in several pure layers (e.g.
+        ``{"assistant_response": {"wrapper_layer": {...}}}``) is
+        stripped out to the outermost pure layer, one layer at a
+        time. Returns sorted, non-overlapping spans.
         """
         if not spans:
             return list(spans)
-        decoder = json.JSONDecoder()
-        objects: list[tuple[int, int, object]] = []
-        pos = 0
-        while True:
-            brace = re.search(r"\{", text[pos:])
-            if brace is None:
-                break
-            start = pos + brace.start()
-            try:
-                candidate, end = decoder.raw_decode(text[start:])
-            except (json.JSONDecodeError, ValueError):
-                pos = start + 1
-                continue
-            objects.append((start, start + end, candidate))
-            pos = start + 1
-
-        def _is_tool_call(value: object) -> bool:
-            return (
-                isinstance(value, dict)
-                and isinstance(value.get("name"), str)
-                and isinstance(value.get("parameters"), dict)
-            )
-
-        def _envelope_has_prose(value: object) -> bool:
-            """True when a non-call string in ``value`` reads as prose."""
-            if isinstance(value, dict):
-                if _is_tool_call(value):
-                    return False
-                for key, item in value.items():
-                    if isinstance(key, str) and (
-                        any(ch.isspace() for ch in key)
-                        or re.search(r"[\u4e00-\u9fff]", key)
-                    ):
-                        return True
-                    if key == "tool_calls" and isinstance(item, list):
-                        # Call records (and anything nested in them)
-                        # are the envelope's payload, not prose.
-                        continue
-                    if _envelope_has_prose(item):
-                        return True
-                return False
-            if isinstance(value, list):
-                return any(_envelope_has_prose(item) for item in value)
-            if isinstance(value, str):
-                return (
-                    any(ch.isspace() for ch in value)
-                    or re.search(r"[\u4e00-\u9fff]", value) is not None
-                )
-            return False
-
+        objects = LoopDetector._scan_json_objects(text)
         extended = list(spans)
         for start, end in spans:
-            # Smallest JSON object strictly containing this call record.
-            containing = [
-                (obj_start, obj_end, obj)
-                for obj_start, obj_end, obj in objects
-                if obj_start <= start and end <= obj_end
-                and (obj_start, obj_end) != (start, end)
-            ]
-            if not containing:
-                continue
-            obj_start, obj_end, obj = min(
-                containing, key=lambda item: item[1] - item[0]
+            extended.append(
+                LoopDetector._outermost_pure_container(objects, start, end)
             )
-            if isinstance(obj, dict) and not _envelope_has_prose(obj):
-                extended.append((obj_start, obj_end))
-        extended.sort()
-        merged: list[tuple[int, int]] = []
-        for start, end in extended:
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-            else:
-                merged.append((start, end))
-        return merged
+        return LoopDetector._merge_spans(extended)
 
     def _check_tool_cycle(self):
         """Detect a repeating tool-call cycle (A-B-A-B, up to 4-step patterns).
@@ -840,8 +908,25 @@ class LoopDetector:
         tools = [call for _, _, call in tools_with_spans]
         if event_kind is None:
             if not tools:
-                kind = "text"
-                language_text = text
+                # No call record: a block that is nothing but a pure
+                # empty-tool-call envelope (``{"role": "assistant",
+                # "tool_calls": []}``) is structured tool output, not
+                # prose -- its bare key names must not drift (empty
+                # tool_calls, review round 12 follow-up). Anything
+                # left after stripping such envelopes is judged as
+                # prose, exactly as for mixed blocks below.
+                empty_spans = self._empty_tool_call_spans(text)
+                if empty_spans:
+                    remainder = self._prose_remainder(text, empty_spans)
+                    if re.search(r"[A-Za-z\u4e00-\u9fff]", remainder):
+                        kind = "text"
+                        language_text = remainder
+                    else:
+                        kind = "tool_call"
+                        language_text = ""
+                else:
+                    kind = "text"
+                    language_text = text
             else:
                 # A block that mixes prose with tool-call records is
                 # natural-language output for the language rule as long
@@ -849,11 +934,16 @@ class LoopDetector:
                 # 2026-11-13): an English explanation followed by a
                 # ``read`` JSON record is still English output drifting
                 # from a Chinese task. Only a block that is nothing but
-                # call records counts as a tool_call (M3).
+                # call records counts as a tool_call (M3). Pure
+                # empty-tool-call envelopes in the same block are
+                # stripped alongside the call records.
                 remainder = self._prose_remainder(
                     text,
-                    self._extend_spans_with_envelopes(
-                        text, [(start, end) for start, end, _ in tools_with_spans]
+                    self._merge_spans(
+                        self._extend_spans_with_envelopes(
+                            text, [(start, end) for start, end, _ in tools_with_spans]
+                        )
+                        + self._empty_tool_call_spans(text)
                     ),
                 )
                 if re.search(r"[A-Za-z\u4e00-\u9fff]", remainder):
